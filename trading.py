@@ -4,7 +4,6 @@ import os
 import urllib.request
 import yfinance as yf
 
-# Récupération sécurisée du webhook (pour le cloud)
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
 actifs_forex = [
@@ -20,37 +19,6 @@ maintenant = datetime.now()
 minute_actuelle = maintenant.minute
 heure_actuelle = maintenant.hour
 minutes_restantes = 15 - (minute_actuelle % 15)
-
-# Filtre des heures d'or (8h à 18h)
-session_active = 8 <= heure_actuelle <= 18
-
-if not session_active:
-    print("Hors session, pas de scan.")
-    exit()
-
-# Vérification calendrier éco rapide
-alerte_eco = False
-try:
-    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    reponse = urllib.request.urlopen(req)
-    evenements = json.loads(reponse.read().decode("utf-8"))
-    date_jour = maintenant.strftime("%Y-%m-%d")
-    for ev in evenements:
-        if ev.get("impact") == "High" and date_jour in ev.get("date", ""):
-            heure_ev = datetime.strptime(
-                ev.get("date")[:19], "%Y-%m-%dT%H:%M:%S"
-            )
-            diff = (heure_ev - maintenant).total_seconds() / 60
-            if -10 <= diff <= 30:
-                alerte_eco = True
-                break
-except:
-    pass
-
-if alerte_eco:
-    print("Alerte éco active, pas de signal.")
-    exit()
 
 opportunites = []
 
@@ -95,33 +63,32 @@ for symbole in actifs_forex:
     except:
         continue
 
-# CONDITION DE DÉCLENCHEMENT DU PRÉ-SIGNAL AUTOMATIQUE
-# On n'envoie un message sur Discord QUE s'il y a une opportunité ET qu'on est dans les 5 dernières minutes de la bougie M15
-if opportunites and minutes_restantes <= if True:
+# Construction du message de test sécurisé
+if opportunites:
     meilleur = max(opportunites, key=lambda x: x["force"])
-
-    message = f"""🚨 **PRÉ-SIGNAL TRADING AUTO (PC ÉTEINT)** 🚨
+    message = f"""🚨 **TEST DU CLOUD / PRÉ-SIGNAL** 🚨
 
 🎯 **Actif** : **{meilleur['symbole']}**
 💱 **Action** : {meilleur['type']}
 💶 **Prix actuel** : {meilleur['prix']:.5f}
 🛑 **Stop Loss** : `{meilleur['sl']:.5f}`
 🎯 **Take Profit** : `{meilleur['tp']:.5f}`
-⏱️ **Urgence** : Clôture de la bougie M15 dans **{minutes_restantes} minutes** ! Bouge-toi sur FXCM !
+⏱️ **Statut** : Test réussi depuis GitHub Actions !
+"""
+else:
+    message = """🟢 **TEST DU CLOUD RÉUSSI !** 
+
+Le script tourne parfaitement sur les serveurs de GitHub. Aucune opportunité Forex volatile n'a été trouvée à cet instant précis (marché calme), mais la liaison avec ton webhook Discord est validée.
 """
 
-    donnees = {"content": message}
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-    requete = urllib.request.Request(
-        webhook_url, data=json.dumps(donnees).encode("utf-8"), headers=headers
-    )
+donnees = {"content": message}
+headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+requete = urllib.request.Request(
+    webhook_url, data=json.dumps(donnees).encode("utf-8"), headers=headers
+)
 
-    try:
-        urllib.request.urlopen(requete)
-        print("Pré-signal envoyé sur Discord avec succès !")
-    except Exception as e:
-        print("Erreur d'envoi Discord :", e)
-else:
-    print(
-        f"Pas de pré-signal requis pour l'instant (Minutes restantes : {minutes_restantes})."
-    )
+try:
+    urllib.request.urlopen(requete)
+    print("Message de test envoyé sur Discord avec succès !")
+except Exception as e:
+    print("Erreur d'envoi Discord :", e)
