@@ -63,22 +63,23 @@ for symbole in actifs_forex:
     except:
         continue
 
-# Construction du message de test sécurisé
+# Construction du message complet avec toutes les métriques de scalping
 if opportunites:
     meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🚨 **TEST DU CLOUD / PRÉ-SIGNAL** 🚨
+    message = f"""🚨 **PRÉ-SIGNAL TRADING PRO (CLOUD H24)** 🚨
 
-🎯 **Actif** : **{meilleur['symbole']}**
+🎯 **Meilleure opportunité** : **{meilleur['symbole']}**
 💱 **Action** : {meilleur['type']}
-💶 **Prix actuel** : {meilleur['prix']:.5f}
-🛑 **Stop Loss** : `{meilleur['sl']:.5f}`
-🎯 **Take Profit** : `{meilleur['tp']:.5f}`
-⏱️ **Statut** : Test réussi depuis GitHub Actions !
+💶 **Prix d'entrée estimé** : {meilleur['prix']:.5f}
+🛑 **Stop Loss (Dynamique)** : `{meilleur['sl']:.5f}`
+🎯 **Take Profit (Objectif)** : `{meilleur['tp']:.5f}`
+⏱️ **Durée estimée du trade** : 15 à 45 minutes max (2 à 3 bougies M15).
+⏳ **Timing d'entrée** : Clôture M15 dans **{minutes_restantes} min**. Prépare ton ordre !
 """
 else:
-    message = """🟢 **TEST DU CLOUD RÉUSSI !** 
+    message = f"""⏳ **MARCHÉ NEUTRE / CALME** 
 
-Le script tourne parfaitement sur les serveurs de GitHub. Aucune opportunité Forex volatile n'a été trouvée à cet instant précis (marché calme), mais la liaison avec ton webhook Discord est validée.
+Le bot tourne en arrière-plan dans le cloud. Aucune opportunité claire détectée pour l'instant. Prochain point dans **{minutes_restantes} min**.
 """
 
 donnees = {"content": message}
@@ -89,6 +90,6 @@ requete = urllib.request.Request(
 
 try:
     urllib.request.urlopen(requete)
-    print("Message de test envoyé sur Discord avec succès !")
+    print("Message complet envoyé sur Discord avec succès !")
 except Exception as e:
     print("Erreur d'envoi Discord :", e)
