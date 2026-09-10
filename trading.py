@@ -6,13 +6,25 @@ import yfinance as yf
 
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# Catalogue élargi de toutes les paires majeures et cross disponibles chez FXCM
 actifs_forex = [
     "EURUSD=X",
     "GBPUSD=X",
     "USDJPY=X",
     "AUDUSD=X",
     "USDCAD=X",
+    "NZDUSD=X",
+    "USDCHF=X",
     "EURGBP=X",
+    "EURJPY=X",
+    "GBPJPY=X",
+    "EURAUD=X",
+    "GBPAUD=X",
+    "AUDJPY=X",
+    "EURCAD=X",
+    "AUDCAD=X",
+    "NZDJPY=X",
+    "CHFJPY=X",
 ]
 
 maintenant = datetime.now()
@@ -37,17 +49,16 @@ try:
                 ev.get("date")[:19], "%Y-%m-%dT%H:%M:%S"
             )
             diff = (heure_ev - maintenant).total_seconds() / 60
-            # Si une annonce majeure tombe entre -15 min et +45 min
             if -15 <= diff <= 45:
                 alerte_eco = True
                 message_eco = f"Annonce majeure : '{ev.get('title')}' ({ev.get('country')})"
                 break
 except Exception:
-    pass  # Si le flux rencontre un souci technique, on laisse passer le trade pour ne pas bloquer bêtement
+    pass
 
 opportunites = []
 
-# --- 2. ANALYSE TECHNIQUE (H1 + M15 + SL/TP) ---
+# --- 2. ANALYSE TECHNIQUE ÉLARGIE (H1 + M15 + SL/TP) ---
 for symbole in actifs_forex:
     try:
         ticker = yf.Ticker(symbole)
@@ -74,6 +85,7 @@ for symbole in actifs_forex:
             take_profit = prix_actuel - (risque * 1.5)
             type_ordre = "VENTE (SHORT) 🔴"
 
+        # On garde uniquement les paires qui ont un vrai momentum de marché
         if abs(ecart) > 0.03:
             opportunites.append(
                 {
@@ -95,8 +107,9 @@ if alerte_eco:
 🚨 `{message_eco}`
 *Le marché est trop instable, le bot bloque l'envoi du signal pour te protéger.*"""
 elif opportunites:
+    # Il va chercher le meilleur score de force parmi TOUTES les paires FXCM scannées
     meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🚨 **PRÉ-SIGNAL TRADING BÉTON ARMÉ (CLOUD H24)** 🚨
+    message = f"""🚨 **PRÉ-SIGNAL FXCM MULTI-ACTIFS (CLOUD H24)** 🚨
 
 🎯 **Meilleure opportunité** : **{meilleur['symbole']}**
 💱 **Action** : {meilleur['type']}
@@ -109,7 +122,7 @@ elif opportunites:
 else:
     message = f"""⏳ **MARCHÉ NEUTRE / CALME** 
 
-Le bot tourne en arrière-plan dans le cloud. Analyse technique OK, calendrier propre, mais aucune opportunité volatile nette pour l'instant. Prochain point dans **{minutes_restantes} min**.
+Le bot scanne tout le catalogue FXCM en arrière-plan. Analyse technique OK, calendrier propre, mais aucune opportunité volatile nette pour l'instant. Prochain point dans **{minutes_restantes} min**.
 """
 
 donnees = {"content": message}
@@ -120,6 +133,6 @@ requete = urllib.request.Request(
 
 try:
     urllib.request.urlopen(requete)
-    print("Rapport complet (Technique + Calendrier) envoyé sur Discord !")
+    print("Rapport multi-actifs FXCM envoyé sur Discord !")
 except Exception as e:
     print("Erreur d'envoi Discord :", e)
