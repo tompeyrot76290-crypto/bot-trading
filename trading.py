@@ -97,7 +97,7 @@ for symbole in actifs_forex:
 
 # CONDITION DE DÉCLENCHEMENT DU PRÉ-SIGNAL AUTOMATIQUE
 # On n'envoie un message sur Discord QUE s'il y a une opportunité ET qu'on est dans les 5 dernières minutes de la bougie M15
-if opportunites and minutes_restantes <= 5:
+if opportunites and minutes_restantes <= if True:
     meilleur = max(opportunites, key=lambda x: x["force"])
 
     message = f"""🚨 **PRÉ-SIGNAL TRADING AUTO (PC ÉTEINT)** 🚨
