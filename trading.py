@@ -6,7 +6,6 @@ import yfinance as yf
 
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# Catalogue élargi de toutes les paires majeures et cross disponibles chez FXCM
 actifs_forex = [
     "EURUSD=X",
     "GBPUSD=X",
@@ -58,7 +57,7 @@ except Exception:
 
 opportunites = []
 
-# --- 2. ANALYSE TECHNIQUE ÉLARGIE (H1 + M15 + SL/TP) ---
+# --- 2. ANALYSE TECHNIQUE ET SUR MESURE (H1 + M15 + SL/TP) ---
 for symbole in actifs_forex:
     try:
         ticker = yf.Ticker(symbole)
@@ -85,7 +84,15 @@ for symbole in actifs_forex:
             take_profit = prix_actuel - (risque * 1.5)
             type_ordre = "VENTE (SHORT) 🔴"
 
-        # On garde uniquement les paires qui ont un vrai momentum de marché
+        # Calcul sur mesure de la durée estimée en fonction de l'amplitude du risque (distance au SL/TP)
+        amplitude_pips = abs(risque) * 10000
+        if amplitude_pips < 15:
+            duree_estimee = "10 à 25 minutes (Mouvement rapide)"
+        elif amplitude_pips < 35:
+            duree_estimee = "20 à 45 minutes (Volatilité standard)"
+        else:
+            duree_estimee = "45 à 90 minutes (Large amplitude / Tendance lourde)"
+
         if abs(ecart) > 0.03:
             opportunites.append(
                 {
@@ -96,33 +103,33 @@ for symbole in actifs_forex:
                     "sl": stop_loss,
                     "tp": take_profit,
                     "type": type_ordre,
+                    "duree": duree_estimee,
                 }
             )
     except:
         continue
 
-# --- 3. CONSTRUCTION DU MESSAGE FINAL ---
+# --- 3. CONSTRUCTION DU MESSAGE SUR MESURE ---
 if alerte_eco:
     message = f"""⛔ **FILTRE ÉCONOMIQUE STRICT : INTERDICTION DE TRADER**
 🚨 `{message_eco}`
 *Le marché est trop instable, le bot bloque l'envoi du signal pour te protéger.*"""
 elif opportunites:
-    # Il va chercher le meilleur score de force parmi TOUTES les paires FXCM scannées
     meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🚨 **PRÉ-SIGNAL FXCM MULTI-ACTIFS (CLOUD H24)** 🚨
+    message = f"""🎯 **PRÉ-SIGNAL SUR MESURE (PRO CLOUD H24)** 🎯
 
-🎯 **Meilleure opportunité** : **{meilleur['symbole']}**
-💱 **Action** : {meilleur['type']}
+💱 **Actif sélectionné** : **{meilleur['symbole']}**
+📊 **Type d'ordre** : {meilleur['type']}
 💶 **Prix d'entrée estimé** : {meilleur['prix']:.5f}
 🛑 **Stop Loss (Dynamique)** : `{meilleur['sl']:.5f}`
 🎯 **Take Profit (Objectif)** : `{meilleur['tp']:.5f}`
-⏱️ **Durée estimée du trade** : 15 à 45 minutes max (2 à 3 bougies M15).
-⏳ **Timing d'entrée** : Clôture M15 dans **{minutes_restantes} min**. Calendrier économique vérifié : OK !
+⏱️ **Durée estimée sur mesure** : {meilleur['duree']}
+⏳ **Timing d'entrée** : Clôture M15 dans **{minutes_restantes} min**. Analyse technique et calendrier validés !
 """
 else:
     message = f"""⏳ **MARCHÉ NEUTRE / CALME** 
 
-Le bot scanne tout le catalogue FXCM en arrière-plan. Analyse technique OK, calendrier propre, mais aucune opportunité volatile nette pour l'instant. Prochain point dans **{minutes_restantes} min**.
+Le bot analyse l'ensemble du catalogue FXCM en temps réel. Aucune configuration sur mesure ne satisfait nos critères de rigueur pour l'instant. Prochain point dans **{minutes_restantes} min**.
 """
 
 donnees = {"content": message}
@@ -133,6 +140,6 @@ requete = urllib.request.Request(
 
 try:
     urllib.request.urlopen(requete)
-    print("Rapport multi-actifs FXCM envoyé sur Discord !")
+    print("Rapport sur mesure envoyé sur Discord avec succès !")
 except Exception as e:
     print("Erreur d'envoi Discord :", e)
