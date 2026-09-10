@@ -1,0 +1,29 @@
+name: Bot Trading H24
+
+on:
+  schedule:
+    # Cette ligne indique à GitHub de lancer le script toutes les 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Permet aussi de le lancer à la main depuis le site si tu veux tester
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Installer les outils (yfinance)
+        run: |
+          pip install yfinance
+
+      - name: Lancer le script de trading
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python trading.py
