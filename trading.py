@@ -11,8 +11,7 @@ heure_actuelle = maintenant.heure
 minute_actuelle = maintenant.minute
 minutes_restantes = 15 - (minute_actuelle % 15)
 
-# --- 0. FILTRE DES HORAIRES DE TRADING (08:00 - 18:00 UNIQUEMENT) ---
-# Si on est la nuit ou le weekend, le bot s'arrête net sans spammer
+# --- 0. FILTRE DES HORAIRES DE TRADING (08:00 - 18:00) ---
 if heure_actuelle < 8 or heure_actuelle >= 18:
     print(
         "Hors des horaires de trading actifs (8h-18h). Le bot est en veille."
@@ -65,32 +64,43 @@ except Exception:
 
 opportunites = []
 
-# --- 2. ANALYSE TECHNIQUE ET SUR MESURE (H1 + M15 + SL/TP) ---
+# --- 2. ANALYSE TECHNIQUE STRICTE (Cassure fraîche M15 + Tendance H1) ---
 for symbole in actifs_forex:
     try:
         ticker = yf.Ticker(symbole)
         data_m15 = ticker.history(period="2d", interval="15m")
         data_h1 = ticker.history(period="7d", interval="1h")
 
-        if data_m15.empty or data_h1.empty:
+        if data_m15.empty or data_h1.empty or len(data_m15) < 15:
             continue
 
         prix_actuel = data_m15["Close"].iloc[-1]
         mm20_h1 = data_h1["Close"].rolling(20).mean().iloc[-1]
-
         ecart = ((prix_actuel - mm20_h1) / mm20_h1) * 100
-        tendance = "HAUSSE 🟢" if ecart > 0 else "BAISSE 🔴"
 
-        if ecart > 0:
+        # Condition de cassure fraîche : la dernière bougie M15 doit casser le plus haut ou le plus bas des 10 bougies précédentes
+        plus_haut_recent = data_m15["High"].iloc[-11:-1].max()
+        plus_bas_recent = data_m15["Low"].iloc[-11:-1].min()
+
+        cassure_hausse = prix_actuel > plus_haut_recent and ecart > 0.04
+        cassure_baisse = prix_actuel < plus_bas_recent and ecart < -0.04
+
+        if cassure_hausse:
             stop_loss = data_m15["Low"].iloc[-10:].min() - 0.0005
             risque = prix_actuel - stop_loss
             take_profit = prix_actuel + (risque * 1.5)
             type_ordre = "ACHAT (LONG) 🟢"
-        else:
+            tendance = "HAUSSE 🟢"
+            force = abs(ecart)
+        elif cassure_baisse:
             stop_loss = data_m15["High"].iloc[-10:].max() + 0.0005
             risque = stop_loss - prix_actuel
             take_profit = prix_actuel - (risque * 1.5)
             type_ordre = "VENTE (SHORT) 🔴"
+            tendance = "BAISSE 🔴"
+            force = abs(ecart)
+        else:
+            continue  # Pas de cassure fraîche, on ignore cet actif pour éviter les redites
 
         amplitude_pips = abs(risque) * 10000
         if amplitude_pips < 15:
@@ -100,43 +110,41 @@ for symbole in actifs_forex:
         else:
             duree_estimee = "45 à 90 minutes (Large amplitude / Tendance lourde)"
 
-        # Seuil de force un poil plus strict pour éviter qu'il ne s'emballe sur des micro-variations
-        if abs(ecart) > 0.05:
-            opportunites.append(
-                {
-                    "symbole": symbole.replace("=X", ""),
-                    "prix": prix_actuel,
-                    "tendance": tendance,
-                    "force": abs(ecart),
-                    "sl": stop_loss,
-                    "tp": take_profit,
-                    "type": type_ordre,
-                    "duree": duree_estimee,
-                }
-            )
+        opportunites.append(
+            {
+                "symbole": symbole.replace("=X", ""),
+                "prix": prix_actuel,
+                "tendance": tendance,
+                "force": force,
+                "sl": stop_loss,
+                "tp": take_profit,
+                "type": type_ordre,
+                "duree": duree_estimee,
+            }
+        )
     except:
         continue
 
-# --- 3. CONSTRUCTION DU MESSAGE SUR MESURE ---
+# --- 3. CONSTRUCTION DU MESSAGE UNIQUE ---
 if alerte_eco:
     message = f"""⛔ **FILTRE ÉCONOMIQUE STRICT : INTERDICTION DE TRADER**
 🚨 `{message_eco}`
-*Annonce majeure en cours, le bot coupe les signaux pour te protéger.*"""
+*Annonce majeure en cours, le bot bloque l'envoi du signal.*"""
 elif opportunites:
+    # On isole uniquement LA meilleure opportunité du moment de cassure
     meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🎯 **PRÉ-SIGNAL SUR MESURE (PRO CLOUD)** 🎯
+    message = f"""🎯 **PRÉ-SIGNAL UNIQUE (CASSURE FRAÎCHE M15)** 🎯
 
 💱 **Actif sélectionné** : **{meilleur['symbole']}**
 📊 **Type d'ordre** : {meilleur['type']}
 💶 **Prix d'entrée estimé** : {meilleur['prix']:.5f}
 🛑 **Stop Loss (Dynamique)** : `{meilleur['sl']:.5f}`
 🎯 **Take Profit (Objectif)** : `{meilleur['tp']:.5f}`
-⏱️ **Durée estimée sur mesure** : {meilleur['duree']}
-⏳ **Timing d'entrée** : Clôture M15 dans **{minutes_restantes} min**. Analyse technique et calendrier validés !
+⏱️ **Durée estimée** : {meilleur['duree']}
+⏳ **Timing** : Clôture M15 dans **{minutes_restantes} min**. Signal validé, une seule alerte envoyée !
 """
 else:
-    # Optionnel : si rien de propre, on n'envoie RIEN sur Discord pour éviter le spam inutile.
-    # Mais si tu veux un rapport de veille neutre, tu peux laisser ce bloc.
+    # Silence radio total si aucune cassure nette n'a lieu
     message = None
 
 if message:
@@ -147,10 +155,8 @@ if message:
     )
     try:
         urllib.request.urlopen(requete)
-        print("Rapport envoyé sur Discord avec succès !")
+        print("Signal unique de cassure envoyé sur Discord !")
     except Exception as e:
         print("Erreur d'envoi Discord :", e)
 else:
-    print(
-        "Marché calme ou hors critères stricts : aucun message polluant envoyé."
-    )
+    print("Marché en consolidation ou sans cassure franche : silence radio.")
