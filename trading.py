@@ -7,7 +7,7 @@ import yfinance as yf
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
 maintenant = datetime.now()
-heure_actuelle = maintenant.heure
+heure_actuelle = maintenant.hour
 minute_actuelle = maintenant.minute
 minutes_restantes = 15 - (minute_actuelle % 15)
 
@@ -16,7 +16,7 @@ if heure_actuelle < 8 or heure_actuelle >= 18:
     print(
         "Hors des horaires de trading actifs (8h-18h). Le bot est en veille."
     )
-    exit()
+    exit(0)
 
 actifs_forex = [
     "EURUSD=X",
@@ -100,7 +100,7 @@ for symbole in actifs_forex:
             tendance = "BAISSE 🔴"
             force = abs(ecart)
         else:
-            continue  # Pas de cassure fraîche, on ignore cet actif pour éviter les redites
+            continue
 
         amplitude_pips = abs(risque) * 10000
         if amplitude_pips < 15:
@@ -131,7 +131,6 @@ if alerte_eco:
 🚨 `{message_eco}`
 *Annonce majeure en cours, le bot bloque l'envoi du signal.*"""
 elif opportunites:
-    # On isole uniquement LA meilleure opportunité du moment de cassure
     meilleur = max(opportunites, key=lambda x: x["force"])
     message = f"""🎯 **PRÉ-SIGNAL UNIQUE (CASSURE FRAÎCHE M15)** 🎯
 
@@ -144,7 +143,6 @@ elif opportunites:
 ⏳ **Timing** : Clôture M15 dans **{minutes_restantes} min**. Signal validé, une seule alerte envoyée !
 """
 else:
-    # Silence radio total si aucune cassure nette n'a lieu
     message = None
 
 if message:
