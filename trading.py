@@ -6,6 +6,19 @@ import yfinance as yf
 
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
+maintenant = datetime.now()
+heure_actuelle = maintenant.heure
+minute_actuelle = maintenant.minute
+minutes_restantes = 15 - (minute_actuelle % 15)
+
+# --- 0. FILTRE DES HORAIRES DE TRADING (08:00 - 18:00 UNIQUEMENT) ---
+# Si on est la nuit ou le weekend, le bot s'arrête net sans spammer
+if heure_actuelle < 8 or heure_actuelle >= 18:
+    print(
+        "Hors des horaires de trading actifs (8h-18h). Le bot est en veille."
+    )
+    exit()
+
 actifs_forex = [
     "EURUSD=X",
     "GBPUSD=X",
@@ -25,11 +38,6 @@ actifs_forex = [
     "NZDJPY=X",
     "CHFJPY=X",
 ]
-
-maintenant = datetime.now()
-minute_actuelle = maintenant.minute
-heure_actuelle = maintenant.hour
-minutes_restantes = 15 - (minute_actuelle % 15)
 
 # --- 1. FILTRE DU CALENDRIER ÉCONOMIQUE EN DIRECT ---
 alerte_eco = False
@@ -84,7 +92,6 @@ for symbole in actifs_forex:
             take_profit = prix_actuel - (risque * 1.5)
             type_ordre = "VENTE (SHORT) 🔴"
 
-        # Calcul sur mesure de la durée estimée en fonction de l'amplitude du risque (distance au SL/TP)
         amplitude_pips = abs(risque) * 10000
         if amplitude_pips < 15:
             duree_estimee = "10 à 25 minutes (Mouvement rapide)"
@@ -93,7 +100,8 @@ for symbole in actifs_forex:
         else:
             duree_estimee = "45 à 90 minutes (Large amplitude / Tendance lourde)"
 
-        if abs(ecart) > 0.03:
+        # Seuil de force un poil plus strict pour éviter qu'il ne s'emballe sur des micro-variations
+        if abs(ecart) > 0.05:
             opportunites.append(
                 {
                     "symbole": symbole.replace("=X", ""),
@@ -113,10 +121,10 @@ for symbole in actifs_forex:
 if alerte_eco:
     message = f"""⛔ **FILTRE ÉCONOMIQUE STRICT : INTERDICTION DE TRADER**
 🚨 `{message_eco}`
-*Le marché est trop instable, le bot bloque l'envoi du signal pour te protéger.*"""
+*Annonce majeure en cours, le bot coupe les signaux pour te protéger.*"""
 elif opportunites:
     meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🎯 **PRÉ-SIGNAL SUR MESURE (PRO CLOUD H24)** 🎯
+    message = f"""🎯 **PRÉ-SIGNAL SUR MESURE (PRO CLOUD)** 🎯
 
 💱 **Actif sélectionné** : **{meilleur['symbole']}**
 📊 **Type d'ordre** : {meilleur['type']}
@@ -127,19 +135,22 @@ elif opportunites:
 ⏳ **Timing d'entrée** : Clôture M15 dans **{minutes_restantes} min**. Analyse technique et calendrier validés !
 """
 else:
-    message = f"""⏳ **MARCHÉ NEUTRE / CALME** 
+    # Optionnel : si rien de propre, on n'envoie RIEN sur Discord pour éviter le spam inutile.
+    # Mais si tu veux un rapport de veille neutre, tu peux laisser ce bloc.
+    message = None
 
-Le bot analyse l'ensemble du catalogue FXCM en temps réel. Aucune configuration sur mesure ne satisfait nos critères de rigueur pour l'instant. Prochain point dans **{minutes_restantes} min**.
-"""
-
-donnees = {"content": message}
-headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-requete = urllib.request.Request(
-    webhook_url, data=json.dumps(donnees).encode("utf-8"), headers=headers
-)
-
-try:
-    urllib.request.urlopen(requete)
-    print("Rapport sur mesure envoyé sur Discord avec succès !")
-except Exception as e:
-    print("Erreur d'envoi Discord :", e)
+if message:
+    donnees = {"content": message}
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    requete = urllib.request.Request(
+        webhook_url, data=json.dumps(donnees).encode("utf-8"), headers=headers
+    )
+    try:
+        urllib.request.urlopen(requete)
+        print("Rapport envoyé sur Discord avec succès !")
+    except Exception as e:
+        print("Erreur d'envoi Discord :", e)
+else:
+    print(
+        "Marché calme ou hors critères stricts : aucun message polluant envoyé."
+    )
