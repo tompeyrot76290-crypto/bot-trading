@@ -38,7 +38,7 @@ actifs_forex = [
     "CHFJPY=X",
 ]
 
-# --- 1. FILTRE DU CALENDRIER ÉCONOMIQUE EN DIRECT ---
+# --- 1. FILTRE DU CALENDRIER ÉCONOMIQUE EN DIRECT (LE JUGE SUPRÊME) ---
 alerte_eco = False
 message_eco = ""
 try:
@@ -55,6 +55,7 @@ try:
                 ev.get("date")[:19], "%Y-%m-%dT%H:%M:%S"
             )
             diff = (heure_ev - maintenant).total_seconds() / 60
+            # Fenêtre de sécurité stricte : -15m / +45m autour de l'annonce majeure
             if -15 <= diff <= 45:
                 alerte_eco = True
                 message_eco = f"Annonce majeure : '{ev.get('title')}' ({ev.get('country')})"
@@ -64,7 +65,7 @@ except Exception:
 
 opportunites = []
 
-# --- 2. LOGIQUE DE TRADING PRO (Cassure + Filtre d'épuisement + Risque intelligent) ---
+# --- 2. IA DE TRADING DISCRÉTIONNAIRE (Structure intègre + RR Dynamique) ---
 for symbole in actifs_forex:
     try:
         ticker = yf.Ticker(symbole)
@@ -78,107 +79,93 @@ for symbole in actifs_forex:
         mm20_h1 = data_h1["Close"].rolling(20).mean().iloc[-1]
         ecart = ((prix_actuel - mm20_h1) / mm20_h1) * 100
 
-        # Analyse de la volatilité récente (taille moyenne des bougies M15)
-        data_m15["Candle_Size"] = data_m15["High"] - data_m15["Low"]
-        taille_moyenne_bougie = data_m15["Candle_Size"].iloc[-15:-1].mean()
-        taille_bougie_actuelle = (
-            data_m15["High"].iloc[-1] - data_m15["Low"].iloc[-1]
-        )
-
-        # RÈGLE PRO 1 : FILTRE ANTI-ÉPUISEMENT (Evite d'acheter un pic déjà essoufflé)
-        # Si la bougie actuelle est 2.5 fois plus grande que la moyenne, le mouvement est sur-étiré, on évite le piège.
-        if (
-            taille_moyenne_bougie > 0
-            and taille_bougie_actuelle > taille_moyenne_bougie * 2.5
-        ):
-            continue
-
-        # Condition de cassure fraîche M15
+        # Condition de cassure fraîche M15 validée par la tendance lourde H1
         plus_haut_recent = data_m15["High"].iloc[-11:-1].max()
         plus_bas_recent = data_m15["Low"].iloc[-11:-1].min()
 
         cassure_hausse = prix_actuel > plus_haut_recent and ecart > 0.04
         cassure_baisse = prix_actuel < plus_bas_recent and ecart < -0.04
 
-        if cassure_hausse:
-            # Stop loss technique de base
-            stop_loss_brut = data_m15["Low"].iloc[-10:].min() - 0.0005
-            risque_brut = prix_actuel - stop_loss_brut
-
-            # RÈGLE PRO 2 : PLAFOND DE RISQUE INTELLIGENT (Empêche les SL de 100 pips)
-            # Si le risque dépasse 35 pips, un pro ne prend pas un trade aussi large sur M15.
-            # On resserre intelligemment sur le plus bas de la bougie de cassure ou un pivot proche.
-            max_risque_autorise = 0.0035  # 35 pips max sur Forex
-            if risque_brut > max_risque_autorise:
-                stop_loss = prix_actuel - max_risque_autorise
-            else:
-                stop_loss = stop_loss_brut
-
-            risque = prix_actuel - stop_loss
-            take_profit = prix_actuel + (risque * 1.5)
-            type_ordre = "ACHAT (LONG) 🟢"
-            tendance = "HAUSSE 🟢"
-            force = abs(ecart)
-
-        elif cassure_baisse:
-            stop_loss_brut = data_m15["High"].iloc[-10:].max() + 0.0005
-            risque_brut = stop_loss_brut - prix_actuel
-
-            max_risque_autorise = 0.0035
-            if risque_brut > max_risque_autorise:
-                stop_loss = prix_actuel + max_risque_autorise
-            else:
-                stop_loss = stop_loss_brut
-
-            risque = stop_loss - prix_actuel
-            take_profit = prix_actuel - (risque * 1.5)
-            type_ordre = "VENTE (SHORT) 🔴"
-            tendance = "BAISSE 🔴"
-            force = abs(ecart)
-        else:
+        if not cassure_hausse and not cassure_baisse:
             continue
 
-        amplitude_pips = abs(risque) * 10000
-        # Durées réalistes calées sur des objectifs courts et percutants
-        if amplitude_pips < 15:
-            duree_estimee = "10 à 25 minutes (Scalping rapide)"
-        elif amplitude_pips < 25:
-            duree_estimee = "20 à 40 minutes (Impulsion standard)"
+        # Analyse de la structure technique pure (Stop loss sur les vrais pivots)
+        if cassure_hausse:
+            stop_loss = data_m15["Low"].iloc[-10:].min() - 0.0005
+            risque = prix_actuel - stop_loss
+            type_ordre = "ACHAT (LONG) 🟢"
+            tendance = "HAUSSE 🟢"
         else:
-            duree_estimee = "35 à 60 minutes (Cible optimisée)"
+            stop_loss = data_m15["High"].iloc[-10:].max() + 0.0005
+            risque = stop_loss - prix_actuel
+            type_ordre = "VENTE (SHORT) 🔴"
+            tendance = "BAISSE 🔴"
+
+        amplitude_pips = abs(risque) * 10000
+
+        # FILTRE DE VIABILITÉ : Si le marché est trop instable (> 50 pips), le pro rejette le trade.
+        if amplitude_pips > 50 or amplitude_pips < 8:
+            continue
+
+        # CONVICTION & RR DYNAMIQUE : S'adapte à la force réelle du marché
+        force_absolue = abs(ecart)
+        if force_absolue > 0.10:
+            ratio_rr = 2.2
+            profil_conviction = "Élevée (Tendance lourde validée 🚀)"
+        elif force_absolue > 0.07:
+            ratio_rr = 1.8
+            profil_conviction = "Solide (Impulsion propre ⚡)"
+        else:
+            ratio_rr = 1.5
+            profil_conviction = "Standard (Sortie de range 🎯)"
+
+        if cassure_hausse:
+            take_profit = prix_actuel + (risque * ratio_rr)
+        else:
+            take_profit = prix_actuel - (risque * ratio_rr)
+
+        if amplitude_pips < 20:
+            duree_estimee = "15 à 30 minutes (Scalping net)"
+        elif amplitude_pips < 35:
+            duree_estimee = "30 à 60 minutes (Développement de tendance)"
+        else:
+            duree_estimee = "45 à 90 minutes (Onde d'impulsion large)"
 
         opportunites.append(
             {
                 "symbole": symbole.replace("=X", ""),
                 "prix": prix_actuel,
                 "tendance": tendance,
-                "force": force,
+                "force": force_absolue,
                 "sl": stop_loss,
                 "tp": take_profit,
                 "type": type_ordre,
                 "duree": duree_estimee,
                 "pips_risque": amplitude_pips,
+                "rr": ratio_rr,
+                "conviction": profil_conviction,
             }
         )
     except:
         continue
 
-# --- 3. CONSTRUCTION DU MESSAGE DISCORD ---
+# --- 3. CONSTRUCTION DU MESSAGE DISCORD (MACRO PRIORITAIRE) ---
 if alerte_eco:
     message = f"""⛔ **FILTRE ÉCONOMIQUE STRICT : INTERDICTION DE TRADER**
 🚨 `{message_eco}`
-*Annonce majeure en cours, le bot bloque l'envoi du signal.*"""
+*Annonce majeure en cours, le bot bloque l'envoi du signal pour te protéger.*"""
 elif opportunites:
     meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🎯 **SIGNAL PRO SUR MESURE (IA QUANT)** 🎯
+    message = f"""🧠 **SIGNAL DISCRÉTIONNAIRE PRO (IA SUR-MESURE)** 🧠
 
 💱 **Actif sélectionné** : **{meilleur['symbole']}**
 📊 **Type d'ordre** : {meilleur['type']}
 💶 **Prix d'entrée estimé** : {meilleur['prix']:.5f}
-🛑 **Stop Loss (Optimisé Pro)** : `{meilleur['sl']:.5f}` ({meilleur['pips_risque']:.1f} pips)
-🎯 **Take Profit Réaliste** : `{meilleur['tp']:.5f}`
+🛑 **Stop Loss (Structurel pur)** : `{meilleur['sl']:.5f}` ({meilleur['pips_risque']:.1f} pips)
+🎯 **Take Profit Dynamique** : `{meilleur['tp']:.5f}` (RR calculé : **1:{meilleur['rr']}**)
+🔥 **Niveau de conviction** : {meilleur['conviction']}
 ⏱️ **Durée estimée** : {meilleur['duree']}
-⏳ **Timing** : Clôture M15 dans **{minutes_restantes} min**. Setup validé et filtré contre l'épuisement !
+⏳ **Timing** : Clôture M15 dans **{minutes_restantes} min**. Annonces et structures validées !
 """
 else:
     message = None
@@ -191,10 +178,10 @@ if message:
     )
     try:
         urllib.request.urlopen(requete)
-        print("Signal Pro envoyé sur Discord avec succès !")
+        print("Signal Pro sur-mesure envoyé sur Discord !")
     except Exception as e:
         print("Erreur d'envoi Discord :", e)
 else:
     print(
-        "Marché en consolidation, mouvement épuisé ou sans cassure : silence radio."
+        "Marché en attente, structures invalides ou hors critères : silence radio."
     )
