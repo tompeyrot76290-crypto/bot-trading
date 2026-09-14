@@ -6,6 +6,30 @@ import yfinance as yf
 
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# NOUVEAU : Gestion stricte du fuseau horaire Paris (Europe/Paris)
+try:
+    from zoneinfo import ZoneInfo
+
+    maintenant = datetime.now(ZoneInfo("Europe/Paris"))
+except ImportError:
+    import pytz
+
+    maintenant = datetime.now(pytz.timezone("Europe/Paris"))
+
+heure_actuelle = maintenant.hour
+minute_actuelle = maintenant.minute
+minutes_restantes = 15 - (minute_actuelle % 15)
+
+# --- 0. FILTRE DES HORAIRES DE TRADING (08:00 - 18:00 Heure Française) ---
+if heure_actuelle < 8 or heure_actuelle >= 18:
+    print(
+        f"Hors des horaires de trading actifs ({heure_actuelle}h{minute_actuelle:02d} Paris). Le bot est en veille."
+    )
+    exit(0)
+
+actifs_forex = [
+
+
 maintenant = datetime.now()
 heure_actuelle = maintenant.hour
 minute_actuelle = maintenant.minute
