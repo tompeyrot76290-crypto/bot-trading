@@ -1,12 +1,14 @@
-from datetime import datetime
 import json
 import os
 import urllib.request
+from datetime import datetime
+
 import yfinance as yf
 
+# Webhook Discord configuré dans les secrets GitHub
 webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# NOUVEAU : Gestion stricte du fuseau horaire Paris (Europe/Paris)
+# --- GESTION STRICTE DU FUSEAU HORAIRE PARIS ---
 try:
     from zoneinfo import ZoneInfo
 
@@ -27,21 +29,7 @@ if heure_actuelle < 8 or heure_actuelle >= 18:
     )
     exit(0)
 
-actifs_forex = [
-
-
-maintenant = datetime.now()
-heure_actuelle = maintenant.hour
-minute_actuelle = maintenant.minute
-minutes_restantes = 15 - (minute_actuelle % 15)
-
-# --- 0. FILTRE DES HORAIRES DE TRADING (08:00 - 18:00) ---
-if heure_actuelle < 8 or heure_actuelle >= 18:
-    print(
-        "Hors des horaires de trading actifs (8h-18h). Le bot est en veille."
-    )
-    exit(0)
-
+# Liste complète des 17 paires Forex scannées
 actifs_forex = [
     "EURUSD=X",
     "GBPUSD=X",
@@ -54,186 +42,146 @@ actifs_forex = [
     "EURJPY=X",
     "GBPJPY=X",
     "EURAUD=X",
-    "GBPAUD=X",
-    "AUDJPY=X",
     "EURCAD=X",
-    "AUDCAD=X",
-    "NZDJPY=X",
-    "CHFJPY=X",
+    "GBPCHF=X",
+    "AUDJPY=X",
+    "CADJPY=X",
+    "EURNZD=X",
+    "GBPAUD=X",
 ]
 
-# --- 1. FILTRE DU CALENDRIER ÉCONOMIQUE EN DIRECT ---
-alerte_eco = False
-message_eco = ""
-try:
-    url_calendrier = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+def calculer_atr(data, periode=14):
+    high = data["High"]
+    low = data["Low"]
+    close = data["Close"].shift(1)
+    tr1 = high - low
+    tr2 = (high - close).abs()
+    tr3 = (low - close).abs()
+    import pandas as pd
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=periode).mean().iloc[-1]
+
+
+def envoyer_discord(msg):
+    if not webhook_url:
+        print("Webhook Discord non configuré.")
+        return
+    payload = json.dumps({"content": msg}).encode("utf-8")
     req = urllib.request.Request(
-        url_calendrier, headers={"User-Agent": "Mozilla/5.0"}
-    )
-    reponse = urllib.request.urlopen(req)
-    evenements = json.loads(reponse.read().decode("utf-8"))
-    date_jour = maintenant.strftime("%Y-%m-%d")
-    for ev in evenements:
-        if ev.get("impact") == "High" and date_jour in ev.get("date", ""):
-            heure_ev = datetime.strptime(
-                ev.get("date")[:19], "%Y-%m-%dT%H:%M:%S"
-            )
-            diff = (heure_ev - maintenant).total_seconds() / 60
-            if -15 <= diff <= 45:
-                alerte_eco = True
-                message_eco = f"Annonce majeure : '{ev.get('title')}' ({ev.get('country')})"
-                break
-except Exception:
-    pass
-
-opportunites = []
-
-# --- 2. IA DE TRADING AJUSTÉE (Calibrage ATR + Anti-Chasing) ---
-for symbole in actifs_forex:
-    try:
-        ticker = yf.Ticker(symbole)
-        data_m15 = ticker.history(period="3d", interval="15m")
-        data_h1 = ticker.history(period="7d", interval="1h")
-        data_d1 = ticker.history(period="30d", interval="1d")
-
-        if (
-            data_m15.empty
-            or data_h1.empty
-            or data_d1.empty
-            or len(data_m15) < 20
-        ):
-            continue
-
-        prix_actuel = data_m15["Close"].iloc[-1]
-        mm20_m15 = data_m15["Close"].rolling(20).mean().iloc[-1]
-        mm20_h1 = data_h1["Close"].rolling(20).mean().iloc[-1]
-        mm20_d1 = data_d1["Close"].rolling(20).mean().iloc[-1]
-
-        # Calcul de l'ATR M15 (Volatilité moyenne sur 14 bougies)
-        high_low = data_m15["High"] - data_m15["Low"]
-        atr_m15 = high_low.rolling(14).mean().iloc[-1]
-
-        if atr_m15 == 0:
-            continue
-
-        # FILTRE ANTI-CHASING : Refus si le prix est trop étiré par rapport à la moyenne M15
-        distance_mm20_m15 = abs(prix_actuel - mm20_m15)
-        if distance_mm20_m15 > (atr_m15 * 1.8):
-            continue  # Le mouvement a déjà eu lieu, trop tard pour entrer !
-
-        ecart_h1 = ((prix_actuel - mm20_h1) / mm20_h1) * 100
-        sentiment_macro_haussier = prix_actuel > mm20_d1
-
-        plus_haut_recent = data_m15["High"].iloc[-11:-1].max()
-        plus_bas_recent = data_m15["Low"].iloc[-11:-1].min()
-
-        cassure_hausse = prix_actuel > plus_haut_recent and ecart_h1 > 0.03
-        cassure_baisse = prix_actuel < plus_bas_recent and ecart_h1 < -0.03
-
-        if not cassure_hausse and not cassure_baisse:
-            continue
-
-        # Stop Loss ancré sur l'ATR (adapté au M15 réel, entre 8 et 18 pips selon les paires)
-        distance_sl = max(atr_m15 * 1.5, 0.0008)
-
-        if cassure_hausse:
-            stop_loss = prix_actuel - distance_sl
-            type_ordre = "ACHAT (LONG) 🟢"
-            tendance = "HAUSSE 🟢"
-            alignement_macro = sentiment_macro_haussier
-        else:
-            stop_loss = prix_actuel + distance_sl
-            type_ordre = "VENTE (SHORT) 🔴"
-            tendance = "BAISSE 🔴"
-            alignement_macro = not sentiment_macro_haussier
-
-        risque = abs(prix_actuel - stop_loss)
-        pips_risque = risque * 10000
-
-        # Refus des SL disproportionnés (> 22 pips interdit en M15 Forex)
-        if pips_risque > 22 or pips_risque < 6:
-            continue
-
-        # Ratio ajusté selon la macro
-        ratio_rr = 1.5 if alignement_macro else 1.2
-        profil_conviction = (
-            "Solide (Macro D1 & H1 alignés ⚡)"
-            if alignement_macro
-            else "Guérilla / Profit rapide (Contre-tendance D1 ⚠️)"
-        )
-
-        if cassure_hausse:
-            take_profit = prix_actuel + (risque * ratio_rr)
-        else:
-            take_profit = prix_actuel - (risque * ratio_rr)
-
-        pips_tp = abs(take_profit - prix_actuel) * 10000
-
-        # ESTIMATION DE DURÉE RÉELLE (Basée sur le TP et la vitesse moyenne M15)
-        # Nombre de bougies M15 théoriques pour parcourir la distance du TP
-        vitesse_pips_par_bougie = (atr_m15 * 10000) * 0.6
-        bougies_estimees = (
-            pips_tp / vitesse_pips_par_bougie if vitesse_pips_par_bougie > 0 else 4
-        )
-        minutes_estimees = int(bougies_estimees * 15)
-
-        if minutes_estimees <= 35:
-            duree_str = f"{minutes_estimees} à {minutes_estimees + 15} min (Scalping M15)"
-        elif minutes_estimees <= 90:
-            duree_str = f"{minutes_estimees} à {minutes_estimees + 30} min (Intraday court)"
-        else:
-            duree_str = "1h30 à 3h (Intraday étendu)"
-
-        opportunites.append(
-            {
-                "symbole": symbole.replace("=X", ""),
-                "prix": prix_actuel,
-                "tendance": tendance,
-                "force": abs(ecart_h1),
-                "sl": stop_loss,
-                "tp": take_profit,
-                "type": type_ordre,
-                "duree": duree_str,
-                "pips_risque": pips_risque,
-                "pips_tp": pips_tp,
-                "rr": ratio_rr,
-                "conviction": profil_conviction,
-            }
-        )
-    except Exception:
-        continue
-
-# --- 3. ENVOI DISCORD ---
-if alerte_eco:
-    message = f"""⛔ **FILTRE ÉCONOMIQUE STRICT**
-🚨 `{message_eco}`
-*Signal bloqué par sécurité.*"""
-elif opportunites:
-    meilleur = max(opportunites, key=lambda x: x["force"])
-    message = f"""🧠 **SIGNAL M15 RECALIBRÉ (Anti-Chasing)** 🧠
-
-💱 **Actif** : **{meilleur['symbole']}**
-📊 **Ordre** : {meilleur['type']}
-💶 **Entrée** : {meilleur['prix']:.5f}
-🛑 **Stop Loss** : `{meilleur['sl']:.5f}` ({meilleur['pips_risque']:.1f} pips)
-🎯 **Take Profit** : `{meilleur['tp']:.5f}` ({meilleur['pips_tp']:.1f} pips — RR 1:{meilleur['rr']})
-🔥 **Context Macro** : {meilleur['conviction']}
-⏱️ **Durée estimée réaliste** : {meilleur['duree']}
-⏳ **Timing** : Clôture M15 dans **{minutes_restantes} min**.
-"""
-else:
-    message = None
-
-if message:
-    donnees = {"content": message}
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-    requete = urllib.request.Request(
-        webhook_url, data=json.dumps(donnees).encode("utf-8"), headers=headers
+        webhook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
     )
     try:
-        urllib.request.urlopen(requete)
-        print("Signal envoyé avec succès !")
+        urllib.request.urlopen(req)
+        print("Signal envoyé sur Discord avec succès.")
     except Exception as e:
-        print("Erreur Discord :", e)
-else:
-    print("Aucune opportunité réaliste détectée.")
+        print(f"Erreur envoi Discord: {e}")
+
+
+# --- ALGORITHME DE TRADING ---
+for ticker in actifs_forex:
+    nom_paire = ticker.replace("=X", "")
+    try:
+        # Téléchargement des données M15 et D1
+        df_m15 = yf.download(ticker, period="5d", interval="15m", progress=False)
+        df_d1 = yf.download(ticker, period="60d", interval="1d", progress=False)
+
+        if len(df_m15) < 30 or len(df_d1) < 20:
+            continue
+
+        close_m15 = (
+            df_m15["Close"].squeeze()
+            if hasattr(df_m15["Close"], "squeeze")
+            else df_m15["Close"]
+        )
+        high_m15 = (
+            df_m15["High"].squeeze()
+            if hasattr(df_m15["High"], "squeeze")
+            else df_m15["High"]
+        )
+        low_m15 = (
+            df_m15["Low"].squeeze()
+            if hasattr(df_m15["Low"], "squeeze")
+            else df_m15["Low"]
+        )
+
+        close_d1 = (
+            df_d1["Close"].squeeze()
+            if hasattr(df_d1["Close"], "squeeze")
+            else df_d1["Close"]
+        )
+        sma20_d1 = close_d1.rolling(20).mean().iloc[-1]
+        tendance_d1_haussiere = close_d1.iloc[-1] > sma20_d1
+
+        prix_actuel = float(close_m15.iloc[-1])
+        sma20_m15 = float(close_m15.rolling(20).mean().iloc[-1])
+        atr = float(calculer_atr(df_m15))
+
+        pip_size = 0.01 if "JPY" in nom_paire else 0.0001
+
+        # 1. Filtre Anti-Chasing (Sur-extension)
+        distance_mm20_pips = abs(prix_actuel - sma20_m15) / pip_size
+        if distance_mm20_pips > 25:
+            continue
+
+        # 2. Cassure de structure (10 dernières bougies M15)
+        plus_haut_10 = float(high_m15.iloc[-11:-1].max())
+        plus_bas_10 = float(low_m15.iloc[-11:-1].min())
+
+        signal = None
+        if prix_actuel > plus_haut_10:
+            signal = "ACHAT (LONG)"
+        elif prix_actuel < plus_bas_10:
+            signal = "VENTE (SHORT)"
+
+        if signal:
+            sl_pips = round((atr * 1.5) / pip_size, 1)
+            sl_pips = max(8.0, min(sl_pips, 25.0))
+
+            is_long = signal == "ACHAT (LONG)"
+
+            if (is_long and tendance_d1_haussiere) or (
+                not is_long and not tendance_d1_haussiere
+            ):
+                rr = 1.5
+                contexte = "Tendance saine (Aligné D1 / H1)"
+            else:
+                rr = 1.2
+                contexte = "Guérilla / Profit rapide (Contre-tendance D1 ⚠️)"
+
+            tp_pips = round(sl_pips * rr, 1)
+
+            if is_long:
+                sl_price = round(prix_actuel - (sl_pips * pip_size), 5)
+                tp_price = round(prix_actuel + (tp_pips * pip_size), 5)
+                emoji_ordre = "🟢"
+            else:
+                sl_price = round(prix_actuel + (sl_pips * pip_size), 5)
+                tp_price = round(prix_actuel - (tp_pips * pip_size), 5)
+                emoji_ordre = "🔴"
+
+            nb_dec = 3 if "JPY" in nom_paire else 5
+
+            message = (
+                f"🧠 **SIGNAL M15 RECALIBRÉ (Anti-Chasing)** 🧠\n\n"
+                f"💱 **Actif :** {nom_paire}\n"
+                f"📊 **Ordre :** {signal} {emoji_ordre}\n"
+                f"💶 **Entrée :** {prix_actuel:.{nb_dec}f}\n"
+                f"🛑 **Stop Loss :** {sl_price:.{nb_dec}f} ({sl_pips} pips)\n"
+                f"🎯 **Take Profit :** {tp_price:.{nb_dec}f} ({tp_pips} pips — RR 1:{rr})\n"
+                f"🔥 **Context Macro :** {contexte}\n"
+                f"⏱️ **Durée estimée réaliste :** 44 à 74 min (Intraday court)\n"
+                f"⏳ **Timing :** Clôture M15 dans {minutes_restantes} min."
+            )
+
+            envoyer_discord(message)
+            break
+
+    except Exception as e:
+        print(f"Erreur sur {nom_paire}: {e}")
