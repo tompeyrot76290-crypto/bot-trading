@@ -13,6 +13,7 @@ AVERTISSEMENT : aucun gain garanti. Backtest + compte démo avant tout argent r�
 """
 import os, re, time, argparse, email.utils
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
@@ -38,7 +39,44 @@ FEEDS = [
     "https://www.ecb.europa.eu/rss/press.html",
     "https://www.federalreserve.gov/feeds/press_all.xml",
 ]
+TZ = ZoneInfo("Europe/Paris")                       # gère automatiquement heure d'été / d'hiver
+INTRADAY_START_HOUR = int(os.getenv("INTRADAY_START_HOUR", "8"))   # heure de Paris
+READ_EVERY_MIN = int(os.getenv("READ_EVERY_MIN", "120"))
+JOURS = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
 GREEN, RED, GREY, ORANGE, BLUE = 0x2ECC71, 0xE74C3C, 0x95A5A6, 0xF39C12, 0x3498DB
+
+
+# ============ HEURE FRANCAISE + TRADUCTION ============
+def hm(ts):
+    return pd.Timestamp(ts).tz_convert(TZ).strftime("%H:%M")
+
+
+def jhm(ts):
+    t = pd.Timestamp(ts).tz_convert(TZ)
+    return f"{JOURS[t.weekday()]} {t.strftime('%H:%M')}"
+
+
+_TR = {}
+
+
+def fr(text):
+    """Traduit en français (service gratuit non officiel ; si indisponible, garde l'anglais)."""
+    if text in _TR:
+        return _TR[text]
+    out = text
+    try:
+        r = requests.get("https://translate.googleapis.com/translate_a/single",
+                         params={"client": "gtx", "sl": "en", "tl": "fr", "dt": "t", "q": text}, timeout=8)
+        if r.status_code == 200:
+            out = "".join(seg[0] for seg in r.json()[0] if seg and seg[0]) or text
+    except Exception as e:
+        print("Traduction indisponible:", e)
+    _TR[text] = out
+    return out
+
+
+def ev_name(e):
+    return f"{e['country']} {fr(e['name'])}"
 
 
 # ============ DISCORD ============
@@ -91,6 +129,7 @@ def get_events():
         if e.get("country") not in ("EUR", "USD") or e.get("impact") not in ("High", "Medium"):
             continue
         ev.append({"time": pd.to_datetime(e["date"], utc=True), "title": f"{e['country']} {e['title']}",
+                   "country": e["country"], "name": e["title"],
                    "impact": e["impact"], "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
     return sorted(ev, key=lambda x: x["time"])
 
@@ -185,26 +224,183 @@ def get_news(max_age_h=8):
 
 
 def get_daily():
-    """Tendance journalière + plus haut/bas de la veille."""
+    """Tendance journalière, EMA20/50, plus haut/bas de la veille, fourchette 20 jours."""
     try:
         d = fetch_df("EURUSD=X", "1d", "1y")
         c = d.Close
-        trend = int(np.sign(c.ewm(span=20, adjust=False).mean().iloc[-1] - c.ewm(span=50, adjust=False).mean().iloc[-1]))
+        e20 = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
+        e50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
         today = pd.Timestamp.now(tz="UTC").date()
         prev = d.iloc[-2] if d.index[-1].date() == today else d.iloc[-1]
-        return {"trend": trend, "pdh": float(prev.High), "pdl": float(prev.Low)}
+        last20 = d.iloc[-20:]
+        return {"trend": int(np.sign(e20 - e50)), "ema20": e20, "ema50": e50,
+                "pdh": float(prev.High), "pdl": float(prev.Low),
+                "hi20": float(last20.High.max()), "lo20": float(last20.Low.min()),
+                "chg5": float((c.iloc[-1] - c.iloc[-6]) / PIP) if len(c) > 6 else 0.0}
     except Exception as e:
         print("Données journalières indisponibles:", e)
         return None
 
 
-def build_context(daily):
+# ============ ANALYSE INTRADAY : "pourquoi ça bouge ?" ============
+def pct_since(ticker, start, absolute=False):
+    s = fetch_df(ticker, "5m", "2d")["Close"]
+    ref = s.asof(start)
+    if pd.isna(ref):
+        ref = s.iloc[0]
+    last = s.iloc[-1]
+    return float(last - ref) if absolute else float((last / ref - 1) * 100)
+
+
+def get_drivers(start):
+    """Variation depuis `start` des autres devises vs dollar, du DXY et du rendement US 10 ans."""
+    out = {}
+    for k, t in (("GBP/USD", "GBPUSD=X"), ("AUD/USD", "AUDUSD=X"), ("USD/JPY", "USDJPY=X"), ("DXY", "DX-Y.NYB")):
+        try:
+            out[k] = pct_since(t, start)
+        except Exception as e:
+            print("Indisponible:", k, e)
+    try:
+        out["US10Y"] = pct_since("^TNX", start, absolute=True)
+    except Exception as e:
+        print("Indisponible: US10Y", e)
+    return out
+
+
+def intraday_analysis(df, daily, events, items, now, drivers=None):
+    """Lit la journée EN TEMPS RÉEL à partir des vraies données 1 minute (pas de texte au hasard)."""
+    now_p = now.tz_convert(TZ)
+    start_p = now_p.replace(hour=INTRADAY_START_HOUR, minute=0, second=0, microsecond=0)
+    if now_p < start_p:
+        start_p -= pd.Timedelta(days=1)
+    start = start_p.tz_convert("UTC")
+    d = df[df.index >= start]
+    if len(d) < 30:
+        return None
+    last = float(d.Close.iloc[-1])
+    move = (last - float(d.Open.iloc[0])) / PIP
+    hi, lo = float(d.High.max()), float(d.Low.min())
+    pos = (last - lo) / (hi - lo) if hi > lo else 0.5
+    c5 = d.Close.resample("5min").last().dropna()
+    step = c5.diff().abs().sum()
+    er = float(abs(c5.iloc[-1] - c5.iloc[0]) / step) if len(c5) > 2 and step > 0 else 0.0
+    slope = float(np.polyfit(np.arange(len(c5)), c5.values, 1)[0] / PIP * 12) if len(c5) > 2 else 0.0
+    maxdd = float((c5.cummax() - c5).max() / PIP)
+    maxrally = float((c5 - c5.cummin()).max() / PIP)
+    if move >= 8 and er >= 0.10:
+        dirn, label = 1, "HAUSSIÈRE"
+    elif move <= -8 and er >= 0.10:
+        dirn, label = -1, "BAISSIÈRE"
+    else:
+        dirn, label = 0, "EN RANGE (pas de direction nette)"
+    quality = "propre" if er >= 0.25 else "heurtée"
+    pullback = maxdd if dirn >= 0 else maxrally
+
+    lines = [f"Depuis {INTRADAY_START_HOUR}h (Paris) : **{move:+.1f} pips** → tendance intraday **{label}**" + (f" ({quality})" if dirn else ""),
+             f"Plus haut {hi:.5f} / plus bas {lo:.5f} ({(hi-lo)/PIP:.0f} pips) | prix à {pos*100:.0f}% de la fourchette",
+             f"Pente {slope:+.1f} pips/h | plus gros repli {pullback:.1f} pips"]
+    if dirn and abs(move) >= 15:
+        lines.append(f"Après coup : ≈ {abs(move)/8:.0f}x un stop de 8 pips")
+
+    fond = "indisponible"
+    daily_notes = []
+    if daily:
+        t = daily["trend"]
+        fond = "BAISSIER" if t < 0 else "HAUSSIER" if t > 0 else "neutre"
+        gap = (last - daily["ema20"]) / PIP
+        rng20 = daily["hi20"] - daily["lo20"]
+        lines.append(f"Fond (journalier) : **{fond}** | EMA20 jour {daily['ema20']:.5f} ({gap:+.0f} pips) | 5 derniers jours {daily['chg5']:+.0f} pips")
+        if rng20 > 0 and t != 0:
+            ret = (last - daily["lo20"]) / rng20 if t < 0 else (daily["hi20"] - last) / rng20
+            daily_notes.append(f"le prix a repris {ret*100:.0f}% de {'la baisse' if t < 0 else 'la hausse'} des 20 derniers jours")
+        if dirn and dirn != t and t != 0:
+            lines.append(f"⚠️ **Contre-tendance** : mouvement intraday {'haussier' if dirn > 0 else 'baissier'} dans un fond {fond.lower()}")
+
+    # ----- le pourquoi : uniquement des faits mesurés -----
+    why = []
+    dd = df[df.index >= now.normalize()]
+    if daily and len(dd):
+        if dd.Low.min() < daily["pdl"] < last:
+            why.append(f"Les stops sous le plus bas de la veille ({daily['pdl']:.5f}) ont été balayés puis le prix a repris : schéma de prise de liquidité observé")
+        if dd.High.max() > daily["pdh"] > last:
+            why.append(f"Les stops au-dessus du plus haut de la veille ({daily['pdh']:.5f}) ont été balayés puis le prix est retombé : schéma de prise de liquidité observé")
+    asia = df[(df.index >= now.normalize()) & (df.index < now.normalize() + pd.Timedelta(hours=7))]
+    if len(asia) > 20 and now.hour >= 7:
+        ah, al = float(asia.High.max()), float(asia.Low.min())
+        if last > ah:
+            why.append(f"Sortie par le haut du range asiatique ({al:.5f}–{ah:.5f}, {(ah-al)/PIP:.0f} pips) à l'ouverture européenne")
+        elif last < al:
+            why.append(f"Sortie par le bas du range asiatique ({al:.5f}–{ah:.5f}, {(ah-al)/PIP:.0f} pips) à l'ouverture européenne")
+
+    if drivers and dirn:
+        g, a, j = drivers.get("GBP/USD"), drivers.get("AUD/USD"), drivers.get("USD/JPY")
+        if None not in (g, a, j):
+            votes = (g * dirn > 0.03) + (a * dirn > 0.03) + (j * dirn < -0.03)
+            detail = f"GBP/USD {g:+.2f}%, AUD/USD {a:+.2f}%, USD/JPY {j:+.2f}%"
+            if votes >= 2:
+                why.append(f"Le dollar {'faiblit' if dirn > 0 else 'se renforce'} face à plusieurs devises, pas seulement l'euro ({detail}) : mouvement porté par le dollar")
+            elif votes == 0:
+                why.append(f"L'euro bouge presque seul ({detail}) : {'force' if dirn > 0 else 'faiblesse'} propre à l'euro plutôt qu'un mouvement général du dollar")
+            else:
+                why.append(f"Signal dollar mitigé ({detail})")
+        y = drivers.get("US10Y")
+        if y is not None and abs(y) > 0.02:
+            why.append(f"Rendement US 10 ans {y:+.3f} pt depuis {INTRADAY_START_HOUR}h : {'soutient' if (y < 0) == (dirn > 0) else 'contredit'} le mouvement de l'EUR/USD")
+    nb = sum(1 for ts, _, s in items if ts >= start and s > 0)
+    nr = sum(1 for ts, _, s in items if ts >= start and s < 0)
+    if nb or nr:
+        why.append(f"Titres de presse depuis {INTRADAY_START_HOUR}h orientés EUR/USD : {nb} favorable(s) à l'euro, {nr} favorable(s) au dollar")
+    passed = [ev_name(e) for e in events if start <= e["time"] <= now]
+    if passed:
+        why.append("Annonces déjà publiées depuis le début de la journée : " + " ; ".join(passed[:4]) + " (valeurs réelles non fournies par ma source)")
+    if dirn and daily and dirn != daily["trend"] and daily["trend"] != 0:
+        t = daily["trend"]
+        notes = "; ".join(daily_notes) if daily_notes else "fond inchangé"
+        crossed = (last > daily["ema20"]) if t < 0 else (last < daily["ema20"])
+        if crossed:
+            tail = f"Le prix a déjà repassé l'EMA20 journalière ({daily['ema20']:.5f}) : début de retournement possible, à confirmer (la tendance de fond ne bascule qu'avec l'EMA20 sous/sur l'EMA50)"
+        else:
+            tail = f"Tant que le prix reste {'sous' if t < 0 else 'au-dessus de'} l'EMA20 journalière ({daily['ema20']:.5f}), le fond ne change pas"
+        why.append(f"Lecture : {'rebond' if t < 0 else 'repli'} dans un fond {fond.lower()} ({notes}). {tail}")
+    if not why:
+        why.append("Aucun facteur mesurable ne ressort clairement pour l'instant")
+    return {"summary": "\n".join(lines), "why": "\n".join("• " + w for w in why), "dirn": dirn}
+
+
+def get_forum_chatter(max_items=3):
+    """Titres récents du forum Reddit r/Forex parlant de l'euro (peut échouer depuis GitHub : tolérant)."""
+    out = []
+    try:
+        r = requests.get("https://www.reddit.com/r/Forex/.rss", timeout=15, headers={"User-Agent": "Mozilla/5.0 (eurusd-bot)"})
+        root = ET.fromstring(r.content)
+        for el in root.iter():
+            if el.tag.endswith("entry"):
+                title = next((c.text for c in el if c.tag.endswith("title")), "") or ""
+                if re.search(r"\b(eur|euro|eurusd|eur/usd|ecb|bce)\b", title.lower()):
+                    out.append(title.strip())
+    except Exception as e:
+        print("Reddit indisponible:", e)
+    return out[:max_items]
+
+
+def build_context(daily, df=None, events=(), now=None):
     m_score, m_reasons, snap = get_macro()
     n_score, items = get_news()
+    now = now or pd.Timestamp.now(tz="UTC")
     bias = m_score + n_score
     top = [(t, s) for _, t, s in items if s != 0][:3] or [(t, s) for _, t, s in items][:3]
+    ia = None
+    if df is not None:
+        try:
+            start_p = now.tz_convert(TZ).replace(hour=INTRADAY_START_HOUR, minute=0, second=0, microsecond=0)
+            if now.tz_convert(TZ) < start_p:
+                start_p -= pd.Timedelta(days=1)
+            ia = intraday_analysis(df, daily, list(events), items, now, get_drivers(start_p.tz_convert("UTC")))
+        except Exception as e:
+            print("Analyse intraday impossible:", e)
     return {"bias": bias, "macro_score": m_score, "news_score": n_score, "macro_reasons": m_reasons,
-            "snap": snap, "headlines": top, "n_headlines": len(items), "daily": daily}
+            "snap": snap, "headlines": top, "n_headlines": len(items), "daily": daily, "items": items,
+            "intraday": ia, "forum": get_forum_chatter()}
 
 
 def bias_label(b):
@@ -215,17 +411,26 @@ def bias_label(b):
 
 def market_read(ctx, events, now):
     nxt = [e for e in events if e["time"] > now][:4]
-    agenda = "\n".join(f"{'🔴' if e['impact']=='High' else '🟠'} {e['time'].strftime('%a %H:%M')} UTC — {e['title']}" for e in nxt) or "Rien de notable à venir"
+    agenda = "\n".join(f"{'🔴' if e['impact']=='High' else '🟠'} {jhm(e['time'])} — {ev_name(e)}" for e in nxt) or "Rien de notable à venir"
     snap = "\n".join(f"**{k}** : {v}" for k, v in ctx["snap"].items()) or "indisponible"
-    heads = "\n".join(f"{'🟢' if s>0 else '🔴' if s<0 else '•'} {t[:140]}" for t, s in ctx["headlines"]) or "Aucun titre récent exploitable"
+    heads = "\n".join(f"{'🟢' if s>0 else '🔴' if s<0 else '•'} {fr(re.sub(r' - [^-]+$', '', t))[:150]}" for t, s in ctx["headlines"]) or "Aucun titre récent exploitable"
     d = ctx["daily"]
-    daily = "indisponible" if not d else f"tendance {'haussière' if d['trend']>0 else 'baissière' if d['trend']<0 else 'neutre'} | veille H {d['pdh']:.5f} / B {d['pdl']:.5f}"
+    daily = "indisponible" if not d else f"tendance {'haussière' if d['trend']>0 else 'baissière' if d['trend']<0 else 'neutre'}\nveille : haut {d['pdh']:.5f} / bas {d['pdl']:.5f}"
     why = "\n".join(f"• {r}" for r in ctx["macro_reasons"]) or "Pas de mouvement macro marquant"
+    fields = []
+    ia = ctx.get("intraday")
+    if ia:
+        fields += [(f"📈 Lecture de la journée (temps réel, 1 min)", ia["summary"], False),
+                   ("🔎 Pourquoi ça bouge (faits mesurés)", ia["why"], False)]
+    fields += [("Marchés liés", snap, True), ("Contexte journalier", daily, True),
+               ("Ce qui se dit (presse)", heads, False)]
+    if ctx.get("forum"):
+        fields.append(("💬 Ambiance traders (Reddit r/Forex)", "\n".join("• " + fr(t)[:140] for t in ctx["forum"]), False))
+    fields.append(("Prochaines annonces (heure de Paris)", agenda, False))
     discord(f"🧠 Lecture du marché — {bias_label(ctx['bias'])}",
-            f"Score macro {ctx['macro_score']:+.1f} | Score news {ctx['news_score']:+.1f} ({ctx['n_headlines']} titres analysés)\n\n{why}",
-            GREEN if ctx["bias"] >= 2 else RED if ctx["bias"] <= -2 else GREY,
-            [("Marchés liés", snap, True), ("Contexte journalier", daily, True),
-             ("Ce qui se dit", heads, False), ("Prochaines annonces", agenda, False)])
+            f"Score macro {ctx['macro_score']:+.1f} | Score actualités {ctx['news_score']:+.1f} ({ctx['n_headlines']} titres analysés)\n\n{why}\n\n"
+            f"_Ce sont des corrélations mesurées, pas une certitude sur les causes._",
+            GREEN if ctx["bias"] >= 2 else RED if ctx["bias"] <= -2 else GREY, fields)
 
 
 # ============ INDICATEURS ============
@@ -255,10 +460,10 @@ def news_state(now, events):
         m = (e["time"] - now).total_seconds() / 60
         if e["impact"] == "High" and (-3 <= m <= MAX_HOLD_MIN + 5):
             if m >= 0:
-                return "block", f"annonce majeure dans {int(m)} min ({e['title']}) : un trade de {MAX_HOLD_MIN} min serait pris dedans"
-            return "block", f"{e['title']} vient de tomber, spread et volatilité instables"
+                return "block", f"annonce majeure dans {int(m)} min ({ev_name(e)}) : un trade de {MAX_HOLD_MIN} min serait pris dedans"
+            return "block", f"{ev_name(e)} vient de tomber, spread et volatilité instables"
         if e["impact"] == "Medium" and (-2 <= m <= 10):
-            return "block", f"annonce moyenne proche ({e['title']})"
+            return "block", f"annonce moyenne proche ({ev_name(e)})"
     for e in events:
         m = (e["time"] - now).total_seconds() / 60
         if e["impact"] == "High" and (-30 <= m < -3):
@@ -325,9 +530,9 @@ def decide(df, i, events, ctx=None):
         move = (c - ref) / PIP
         if abs(move) >= 4:
             if np.sign(move) == sgn:
-                score += 10; reasons.append(f"Cohérent avec la réaction à {info['title']} ({move:+.0f} pips depuis l'annonce)")
+                score += 10; reasons.append(f"Cohérent avec la réaction à {ev_name(info)} ({move:+.0f} pips depuis l'annonce)")
             else:
-                score -= 25; reasons.append(f"Contre la réaction à {info['title']} ({move:+.0f} pips)")
+                score -= 25; reasons.append(f"Contre la réaction à {ev_name(info)} ({move:+.0f} pips)")
 
     if ctx:
         b = ctx["bias"]
@@ -361,7 +566,7 @@ def decide(df, i, events, ctx=None):
 
     nxt = next((e for e in events if e["time"] > now and e["impact"] == "High"), None)
     if nxt:
-        reasons.append(f"Prochaine annonce majeure : {nxt['title']} à {nxt['time'].strftime('%H:%M')} UTC")
+        reasons.append(f"Prochaine annonce majeure : {ev_name(nxt)} à {hm(nxt['time'])} (heure de Paris)")
 
     if score < MIN_SCORE:
         return {"reason": f"setup '{why}' détecté mais score {score}/100 < {MIN_SCORE} (confluence insuffisante)"}
@@ -384,7 +589,7 @@ def send_signal(s):
              ("🛑 Stop", f"**{s['sl']:.5f}**\n{s['stop_pips']:.1f} pips", True),
              ("🎯 Take profit", f"**{s['tp']:.5f}**\n{s['tp_pips']:.1f} pips (1:{RR:g})", True),
              ("📦 Taille", f"**{s['lots']:.2f} lot**\nrisque ≈ {s['risk_amt']:.0f}$ ({RISK_PCT:g}%)", True),
-             ("⏱ Sortie max", f"{exit_by.strftime('%H:%M')} UTC\nferme si ni TP ni SL", True)])
+             ("⏱ Sortie max", f"{hm(exit_by)} (heure de Paris)\nferme si ni TP ni SL", True)])
 
 
 # ============ BACKTEST (partie technique uniquement) ============
@@ -429,7 +634,7 @@ def live(minutes):
     events, ev_ts, ctx, ctx_ts, daily, daily_ts, read_ts = [], 0, None, 0, None, 0, 0
     sent_briefs, sent_days = set(), set()
     last_signal, count, last_idle, last_idle_ts = None, 0, None, 0
-    discord("🤖 Bot EUR/USD en ligne", f"Surveillance active pendant ~{int(minutes/60)}h. Je ne te dérange que pour un vrai setup, une annonce ou une lecture de marché.", GREY)
+    discord("🤖 Bot EUR/USD en ligne", f"Surveillance active pendant ~{int(minutes/60)}h. Je ne te dérange que pour un vrai setup, une annonce ou une lecture de marché. Toutes les heures affichées sont en heure de Paris.", GREY)
     while time.time() < end:
         try:
             now = pd.Timestamp.now(tz="UTC")
@@ -439,28 +644,29 @@ def live(minutes):
                     events, ev_ts = ev, time.time()
             if time.time() - daily_ts > 3600:
                 daily, daily_ts = get_daily(), time.time()
+            df = add_indicators(get_candles("5d")).iloc[:-1]  # retire la bougie en cours
             if time.time() - ctx_ts > 600:
-                ctx, ctx_ts = build_context(daily), time.time()
-            if ctx and time.time() - read_ts > 2 * 3600:
+                ctx, ctx_ts = build_context(daily, df, events, now), time.time()
+            if ctx and time.time() - read_ts > READ_EVERY_MIN * 60:
                 market_read(ctx, events, now)
                 read_ts = time.time()
-            if now.date() not in sent_days:
-                sent_days.add(now.date())
-                today = [e for e in events if e["time"].date() == now.date()]
+            today_fr = now.tz_convert(TZ).date()
+            if today_fr not in sent_days:
+                sent_days.add(today_fr)
+                today = [e for e in events if e["time"].tz_convert(TZ).date() == today_fr]
                 if today:
-                    discord("📅 Agenda du jour (EUR/USD)", "\n".join(
-                        f"{'🔴' if e['impact']=='High' else '🟠'} {e['time'].strftime('%H:%M')} UTC — {e['title']}" for e in today), BLUE)
+                    discord("📅 Agenda du jour (heure de Paris)", "\n".join(
+                        f"{'🔴' if e['impact']=='High' else '🟠'} {hm(e['time'])} — {ev_name(e)}" for e in today), BLUE)
             for e in events:
                 m = (e["time"] - now).total_seconds() / 60
                 key = (e["time"], e["title"])
                 if e["impact"] == "High" and 0 < m <= 30 and key not in sent_briefs:
                     sent_briefs.add(key)
                     bias = f"\nBiais actuel du marché : {bias_label(ctx['bias'])}" if ctx else ""
-                    discord(f"⚠️ {e['title']} dans {int(m)} min",
-                            f"Heure : {e['time'].strftime('%H:%M')} UTC\nPrévu : {e['forecast'] or '?'} | Précédent : {e['previous'] or '?'}{bias}\n\n"
+                    discord(f"⚠️ {ev_name(e)} dans {int(m)} min",
+                            f"Heure : {hm(e['time'])} (Paris)\nPrévu : {e['forecast'] or '?'} | Précédent : {e['previous'] or '?'}{bias}\n\n"
                             f"**Plan :** aucun trade jusqu'à +3 min après la publication. Ensuite je cherche un pullback dans le sens de l'impulsion.",
                             ORANGE)
-            df = add_indicators(get_candles("5d")).iloc[:-1]  # retire la bougie en cours
             s = decide(df, len(df) - 1, events, ctx)
             if "side" in s:
                 if (last_signal is None or (now - last_signal).total_seconds() > COOLDOWN_MIN * 60) and count < MAX_SIGNALS_PER_SESSION:
