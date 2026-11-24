@@ -41,7 +41,11 @@ FEEDS = [
 ]
 TZ = ZoneInfo("Europe/Paris")                       # gère automatiquement heure d'été / d'hiver
 INTRADAY_START_HOUR = int(os.getenv("INTRADAY_START_HOUR", "8"))   # heure de Paris
-READ_EVERY_MIN = int(os.getenv("READ_EVERY_MIN", "120"))
+READ_EVERY_MIN = int(os.getenv("READ_EVERY_MIN", "60"))          # point marché périodique (alterne rapide / complet)
+FAST_MOVE_PIPS = float(os.getenv("FAST_MOVE_PIPS", "12"))        # alerte "mouvement rapide" (pips en 15 min)
+CHANGE_MIN_GAP = int(os.getenv("CHANGE_MIN_GAP", "10"))          # délai mini entre deux "le conseil change"
+MAX_SOFT_PER_HOUR = int(os.getenv("MAX_SOFT_PER_HOUR", "5"))     # plafond de messages non critiques par heure
+_LAST_SENT = {"t": 0.0}
 JOURS = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
 GREEN, RED, GREY, ORANGE, BLUE = 0x2ECC71, 0xE74C3C, 0x95A5A6, 0xF39C12, 0x3498DB
 
@@ -82,6 +86,7 @@ def ev_name(e):
 # ============ DISCORD ============
 def discord(title, desc="", color=BLUE, fields=None):
     print(f"\n[{title}]\n{desc}\n")
+    _LAST_SENT["t"] = time.time()
     if not WEBHOOK:
         return
     embed = {"title": title[:256], "description": desc[:4000], "color": color,
@@ -417,7 +422,7 @@ def bias_label(b):
     return "⚪ NEUTRE / pas de biais clair"
 
 
-def market_read(ctx, events, now, df=None):
+def market_read(ctx, events, now, df=None, full=True, tech=None):
     nxt = [e for e in events if e["time"] > now][:4]
     agenda = "\n".join(f"{'🔴' if e['impact']=='High' else '🟠'} {jhm(e['time'])} — {ev_name(e)}" for e in nxt) or "Rien de notable à venir"
     snap = "\n".join(f"**{k}** : {v}" for k, v in ctx["snap"].items()) or "indisponible"
@@ -432,12 +437,14 @@ def market_read(ctx, events, now, df=None):
     if ia:
         fields.append(("🧾 Récap de la journée", cut(ia["recap"]), False))
     fields.append(outlook_field(events, now))
-    fields += [("Marchés liés", snap, True), ("Contexte journalier", daily, True), ("Ce qui se dit (presse)", cut(heads), False)]
-    if ctx.get("forum"):
-        fields.append(("💬 Ambiance traders (Reddit r/Forex)", cut("\n".join("• " + fr(t)[:140] for t in ctx["forum"])), False))
+    if full:
+        fields += [("Marchés liés", snap, True), ("Contexte journalier", daily, True), ("Ce qui se dit (presse)", cut(heads), False)]
+        if ctx.get("forum"):
+            fields.append(("💬 Ambiance traders (Reddit r/Forex)", cut("\n".join("• " + fr(t)[:140] for t in ctx["forum"])), False))
     fields.append(("Prochaines annonces (heure de Paris)", agenda, False))
-    discord(f"🧠 Lecture du marché — {bias_label(ctx['bias'])}",
-            f"Score macro {ctx['macro_score']:+.1f} | Score actualités {ctx['news_score']:+.1f} ({ctx['n_headlines']} titres analysés)\n\n{why}",
+    discord(f"🧠 {'Lecture complète' if full else 'Point rapide'} — {bias_label(ctx['bias'])}",
+            f"Score macro {ctx['macro_score']:+.1f} | Score actualités {ctx['news_score']:+.1f} ({ctx['n_headlines']} titres analysés)\n\n{why}"
+            + (f"\n\n🛠 Signal technique : {tech}" if tech else ""),
             GREEN if ctx["bias"] >= 2 else RED if ctx["bias"] <= -2 else GREY, fields)
 
 
@@ -815,6 +822,40 @@ def outlook_field(events, now, horizon_h=36):
 
 
 
+def event_reaction(e, ctx, df, events, now):
+    """5 min après une annonce majeure : ce que le prix a fait, et quoi faire ensuite."""
+    ref = float(df.Close.asof(e["time"]))
+    after = df[df.index >= e["time"]]
+    if len(after) < 3 or np.isnan(ref):
+        return
+    last = float(df.Close.iloc[-1])
+    mv = (last - ref) / PIP
+    hi, lo = (float(after.High.max()) - ref) / PIP, (float(after.Low.min()) - ref) / PIP
+    atr = float(df.atr.iloc[-1]) / PIP
+    force = "forte" if abs(mv) >= max(8, 4 * atr) else "modérée" if abs(mv) >= max(4, 2 * atr) else "faible"
+    if abs(mv) < 3:
+        verdict = "quasi nulle (marché indécis ou chiffre proche du consensus)"
+    else:
+        verdict = f"{force}, {'haussière (EUR/USD ⬆️)' if mv > 0 else 'baissière (EUR/USD ⬇️)'}"
+    discord(f"📊 Réaction à {ev_name(e)} : {mv:+.0f} pips",
+            f"Réaction {verdict} depuis la publication (amplitude {lo:+.0f} / {hi:+.0f} pips).\n"
+            f"Prévu : {e['forecast'] or '?'} | Précédent : {e['previous'] or '?'}. Ma source ne donne pas le chiffre publié : "
+            f"compare-le au consensus sur ton calendrier pour confirmer le sens.\n\n"
+            f"Ne cours pas après le 1er mouvement : j'attends un pullback dans le sens de l'impulsion (fenêtre de 3 à 30 min).",
+            GREEN if mv > 3 else RED if mv < -3 else GREY, [advice_field(ctx, df, events, now)])
+
+
+def fast_move_alert(ctx, df, events, now, m15):
+    atr = float(df.atr.iloc[-1]) / PIP
+    fields = [advice_field(ctx, df, events, now)]
+    if ctx and ctx.get("intraday"):
+        fields.append(("🧾 Récap de la journée", cut(ctx["intraday"]["recap"]), False))
+    discord(f"⚡ Mouvement rapide : {m15:+.0f} pips en 15 min",
+            f"EUR/USD {'monte' if m15 > 0 else 'chute'} vite (ATR 1 min : {atr:.1f} pips). "
+            f"Ne cours pas après : regarde le conseil ci-dessous et attends un repli.",
+            GREEN if m15 > 0 else RED, fields)
+
+
 # ============ INDICATEURS ============
 def add_indicators(df):
     df = df.copy()
@@ -1011,15 +1052,34 @@ def backtest():
 
 
 # ============ LIVE ============
+ACT_LABEL = {"wait": "⚪ ATTENDRE", "long": "🟢 ACHETER", "short": "🔴 VENDRE"}
+
+
 def live(minutes):
+    """Cadence des messages (voir README) : briefing 8h, point marché toutes les READ_EVERY_MIN min (rapide/complet en alternance),
+    aperçu 60 min avant une annonce majeure, réaction 5 min après, alerte quand le conseil change durablement,
+    alerte mouvement rapide, signaux d'entrée. Plafond anti-spam pour les messages non critiques."""
     end = time.time() + minutes * 60
-    events, ev_ts, ctx, ctx_ts, daily, daily_ts, read_ts = [], 0, None, 0, None, 0, 0
-    sent_briefs, sent_days, sent_morning = set(), set(), set()
-    last_signal, count, last_idle, last_idle_ts = None, 0, None, 0
-    discord("🤖 Bot EUR/USD en ligne", f"Surveillance active pendant ~{int(minutes/60)}h. Je ne te dérange que pour un vrai setup, une annonce ou une lecture de marché. Toutes les heures affichées sont en heure de Paris.", GREY)
+    events, ev_ts, ctx, ctx_ts, daily, daily_ts = [], 0, None, 0, None, 0
+    sent_briefs, sent_reacts, sent_morning = set(), set(), set()
+    last_signal, count = None, 0
+    hp0 = pd.Timestamp.now(tz="UTC").tz_convert(TZ).hour
+    read_ts = time.time() if hp0 < INTRADAY_START_HOUR + 2 else 0   # le briefing du matin remplace la 1re lecture
+    reads = 0
+    last_key, cand_key, cand_n, last_change_ts, last_fast_ts = None, None, 0, 0, 0
+    soft = []
+
+    def soft_ok():
+        soft[:] = [t for t in soft if time.time() - t < 3600]
+        return len(soft) < MAX_SOFT_PER_HOUR
+
+    discord("🤖 Bot EUR/USD en ligne",
+            f"Surveillance active ~{int(minutes/60)}h (heure de Paris). Cadence : briefing le matin, point marché toutes les {READ_EVERY_MIN} min, "
+            f"+ alertes quand ça compte (annonce, changement de conseil, mouvement rapide, signal).", GREY)
     while time.time() < end:
         try:
             now = pd.Timestamp.now(tz="UTC")
+            in_session = TRADE_HOURS_UTC[0] <= now.hour < TRADE_HOURS_UTC[1] and now.weekday() < 5
             if time.time() - ev_ts > 6 * 3600:
                 ev = get_events()
                 if ev is not None:
@@ -1029,42 +1089,74 @@ def live(minutes):
             df = add_indicators(get_candles("5d")).iloc[:-1]  # retire la bougie en cours
             if time.time() - ctx_ts > 600:
                 ctx, ctx_ts = build_context(daily, df, events, now), time.time()
-            if ctx and time.time() - read_ts > READ_EVERY_MIN * 60:
-                market_read(ctx, events, now, df)
-                read_ts = time.time()
             today_fr = now.tz_convert(TZ).date()
             hp = now.tz_convert(TZ).hour
+            quiet = time.time() - _LAST_SENT["t"]
+
+            # 1) Briefing du matin (critique)
             if ctx and today_fr not in sent_morning and INTRADAY_START_HOUR <= hp < INTRADAY_START_HOUR + 2:
                 sent_morning.add(today_fr)
                 try:
                     morning_briefing(ctx, events, df, daily, now)
+                    read_ts, reads = time.time(), 1
                 except Exception as ex:
                     print("Briefing impossible:", ex)
-            if today_fr not in sent_days:
-                sent_days.add(today_fr)
-                today = [e for e in events if e["time"].tz_convert(TZ).date() == today_fr]
-                if today:
-                    discord("📅 Agenda du jour (heure de Paris)", "\n".join(
-                        f"{'🔴' if e['impact']=='High' else '🟠'} {hm(e['time'])} — {ev_name(e)}" for e in today), BLUE,
-                        [advice_field(ctx, df, events, now) if ctx else None, outlook_field(events, now)])
+
+            # 2) Annonces majeures : aperçu (-60 min) et réaction (+5 min) (critiques)
             for e in events:
+                if e["impact"] != "High" or not ctx:
+                    continue
                 m = (e["time"] - now).total_seconds() / 60
                 key = (e["time"], e["title"])
-                if e["impact"] == "High" and 0 < m <= 60 and key not in sent_briefs:
+                if 0 < m <= 60 and key not in sent_briefs:
                     sent_briefs.add(key)
-                    if ctx:
-                        event_preview(e, ctx, df, now)
+                    event_preview(e, ctx, df, now)
+                elif -10 <= m <= -4 and key not in sent_reacts:
+                    sent_reacts.add(key)
+                    event_reaction(e, ctx, df, events, now)
+
             s = decide(df, len(df) - 1, events, ctx)
+
+            # 3) Point marché périodique (alterne rapide / complet) + état du signal technique
+            if ctx and in_session and time.time() - read_ts > READ_EVERY_MIN * 60 and soft_ok():
+                tech = ("setup valide détecté (voir alerte d'entrée)" if "side" in s else f"aucun pour l'instant ({s['reason']})")
+                market_read(ctx, events, now, df, full=(reads % 2 == 0), tech=tech)
+                reads += 1
+                read_ts = time.time()
+                soft.append(time.time())
+
+            quiet = time.time() - _LAST_SENT["t"]
+            if ctx and in_session:
+                # 4) Le conseil change durablement (3 min de stabilité pour éviter le clignotement)
+                a = advise(ctx, df, events, now)
+                key = a["action"]
+                cand_n = cand_n + 1 if key == cand_key else 1
+                cand_key = key
+                if last_key is None:
+                    if cand_n >= 3:
+                        last_key = cand_key
+                elif cand_n >= 3 and cand_key != last_key and time.time() - last_change_ts > CHANGE_MIN_GAP * 60 \
+                        and soft_ok() and quiet > 120:
+                    af = advice_field(ctx, df, events, now)
+                    discord(f"🔄 Le conseil change : {ACT_LABEL[last_key]} → {ACT_LABEL[cand_key]}",
+                            "Ce n'est pas un ordre : c'est la nouvelle orientation du marché d'après mes données. Vérifie le plan ci-dessous.",
+                            GREEN if cand_key == "long" else RED if cand_key == "short" else GREY, [af])
+                    last_key, last_change_ts = cand_key, time.time()
+                    soft.append(time.time())
+
+                # 5) Mouvement rapide
+                near_news = any(e["impact"] == "High" and -10 <= (e["time"] - now).total_seconds() / 60 <= 3 for e in events)
+                m15 = (float(df.Close.iloc[-1]) - float(df.Close.iloc[-16])) / PIP
+                if abs(m15) >= FAST_MOVE_PIPS and not near_news and time.time() - last_fast_ts > 1800 and soft_ok() and quiet > 120:
+                    fast_move_alert(ctx, df, events, now, m15)
+                    last_fast_ts = time.time()
+                    soft.append(time.time())
+
+            # 6) Signal d'entrée technique (critique)
             if "side" in s:
                 if (last_signal is None or (now - last_signal).total_seconds() > COOLDOWN_MIN * 60) and count < MAX_SIGNALS_PER_SESSION:
                     send_signal(s)
                     last_signal, count = now, count + 1
-            else:
-                r = s["reason"]
-                if r != last_idle and time.time() - last_idle_ts > 1800 and "hors session" not in r:
-                    discord("⏸ Pas de trade", f"{r}\n\nAucun signal technique précis pour l'instant : le conseil ci-dessous est une orientation, pas un déclencheur.",
-                            GREY, [advice_field(ctx, df, events, now) if ctx else None])
-                    last_idle, last_idle_ts = r, time.time()
         except Exception as ex:
             print("Erreur boucle:", ex)
         time.sleep(60 - time.time() % 60 + 5)
