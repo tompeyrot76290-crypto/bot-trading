@@ -1,0 +1,41 @@
+name: EURUSD Scalp Bot
+
+on:
+  schedule:
+    - cron: "50 6 * * 1-5"
+    - cron: "45 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test = message test Discord | backtest | live"
+        type: choice
+        default: test
+        options: [test, backtest, live]
+
+concurrency:
+  group: eurusd-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Lancer le bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CAPITAL: ${{ vars.CAPITAL || '1000' }}
+          RISK_PCT: ${{ vars.RISK_PCT || '1' }}
+          MAX_HOLD_MIN: ${{ vars.MAX_HOLD_MIN || '45' }}
+          READ_EVERY_MIN: ${{ vars.READ_EVERY_MIN || '60' }}
+          MODE: ${{ github.event.inputs.mode || 'live' }}
+        run: |
+          if [ "$MODE" = "backtest" ]; then python bot.py --backtest
+          elif [ "$MODE" = "test" ]; then python bot.py --test-discord
+          else python bot.py --minutes 305; fi
