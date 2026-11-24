@@ -27,7 +27,7 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
 PIP = 0.0001
 PIP_VALUE_PER_LOT = 10.0          # USD / pip / lot standard (compte en USD)
 MIN_STOP_PIPS, MAX_STOP_PIPS = 5.0, 12.0
-MAX_HOLD_MIN = 45
+MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "45"))   # durée max d'un trade (mets 15 pour du scalp très court)
 COOLDOWN_MIN = 15
 MAX_SIGNALS_PER_SESSION = 3
 SPREAD_PIPS = 0.8
@@ -233,7 +233,9 @@ def get_daily():
         today = pd.Timestamp.now(tz="UTC").date()
         prev = d.iloc[-2] if d.index[-1].date() == today else d.iloc[-1]
         last20 = d.iloc[-20:]
-        return {"trend": int(np.sign(e20 - e50)), "ema20": e20, "ema50": e50,
+        done = d[d.index.date < today]
+        adr = float((done.High - done.Low).iloc[-10:].mean() / PIP) if len(done) >= 3 else None
+        return {"adr10": adr, "trend": int(np.sign(e20 - e50)), "ema20": e20, "ema50": e50,
                 "pdh": float(prev.High), "pdl": float(prev.Low),
                 "hi20": float(last20.High.max()), "lo20": float(last20.Low.min()),
                 "chg5": float((c.iloc[-1] - c.iloc[-6]) / PIP) if len(c) > 6 else 0.0}
@@ -398,6 +400,9 @@ def build_context(daily, df=None, events=(), now=None):
             ia = intraday_analysis(df, daily, list(events), items, now, get_drivers(start_p.tz_convert("UTC")))
         except Exception as e:
             print("Analyse intraday impossible:", e)
+    if ia and ia.get("dirn"):
+        bias += ia["dirn"] * 1.0
+        m_reasons = m_reasons + [f"Tendance intraday {'haussière' if ia['dirn'] > 0 else 'baissière'} depuis {INTRADAY_START_HOUR}h"]
     return {"bias": bias, "macro_score": m_score, "news_score": n_score, "macro_reasons": m_reasons,
             "snap": snap, "headlines": top, "n_headlines": len(items), "daily": daily, "items": items,
             "intraday": ia, "forum": get_forum_chatter()}
@@ -431,6 +436,193 @@ def market_read(ctx, events, now):
             f"Score macro {ctx['macro_score']:+.1f} | Score actualités {ctx['news_score']:+.1f} ({ctx['n_headlines']} titres analysés)\n\n{why}\n\n"
             f"_Ce sont des corrélations mesurées, pas une certitude sur les causes._",
             GREEN if ctx["bias"] >= 2 else RED if ctx["bias"] <= -2 else GREY, fields)
+
+
+
+# ============ BRIEFING DU MATIN + APERCU D'ANNONCE (scénarios) ============
+def cut(s, n=1000):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def num(s):
+    m = re.search(r"-?\d+(?:[.,]\d+)?", str(s or ""))
+    return float(m.group().replace(",", ".")) if m else None
+
+
+def dollar_votes(drivers):
+    g, a, j = drivers.get("GBP/USD"), drivers.get("AUD/USD"), drivers.get("USD/JPY")
+    if None in (g, a, j):
+        return None
+    weak = int(g > 0.03) + int(a > 0.03) + int(j < -0.03)
+    strong = int(g < -0.03) + int(a < -0.03) + int(j > 0.03)
+    return weak, strong, f"GBP/USD {g:+.2f}%, AUD/USD {a:+.2f}%, USD/JPY {j:+.2f}%"
+
+
+def morning_briefing(ctx, events, df, daily, now):
+    """Scénario du jour : facteurs mesurés, niveaux, invalidation, fenêtres. Un scénario n'est PAS une prévision."""
+    last = float(df.Close.iloc[-1])
+    night_start = now.normalize() - pd.Timedelta(hours=2)          # ≈ ouverture asiatique (22h UTC veille)
+    n = df[df.index >= night_start]
+    if len(n) < 30:
+        return
+    night_move = (last - float(n.Open.iloc[0])) / PIP
+    asia = df[(df.index >= now.normalize()) & (df.index < now.normalize() + pd.Timedelta(hours=7))]
+    base = asia if len(asia) > 20 else n
+    ah, al = float(base.High.max()), float(base.Low.min())
+    drivers = get_drivers(night_start)
+
+    comp, total = [], 0.0
+    if abs(night_move) >= 5:
+        s = float(np.sign(night_move)); total += s
+        comp.append(f"{'➕' if s > 0 else '➖'} EUR/USD {night_move:+.0f} pips depuis l'ouverture asiatique")
+    else:
+        comp.append("▫️ EUR/USD calme depuis l'ouverture asiatique")
+    dv = dollar_votes(drivers)
+    if dv:
+        weak, strong, detail = dv
+        if weak >= 2:
+            total += 1; comp.append(f"➕ Dollar faible face à plusieurs devises ({detail})")
+        elif strong >= 2:
+            total -= 1; comp.append(f"➖ Dollar fort face à plusieurs devises ({detail})")
+        else:
+            comp.append(f"▫️ Dollar sans direction nette ({detail})")
+    y = drivers.get("US10Y")
+    if y is not None and abs(y) > 0.02:
+        s = -float(np.sign(y)); total += 0.5 * s
+        comp.append(f"{'➕' if s > 0 else '➖'} Rendement US 10 ans {y:+.3f} pt ({'moins' if y < 0 else 'plus'} de soutien au dollar)")
+    ns = ctx["news_score"]
+    if abs(ns) >= 0.5:
+        total += float(np.clip(ns * 0.5, -1, 1))
+        comp.append(f"{'➕' if ns > 0 else '➖'} Presse orientée {'euro' if ns > 0 else 'dollar'} (score {ns:+.1f}, {ctx['n_headlines']} titres)")
+    if daily and daily["trend"]:
+        total += 0.5 * daily["trend"]
+        comp.append(f"{'➕' if daily['trend'] > 0 else '➖'} Fond journalier {'haussier' if daily['trend'] > 0 else 'baissier'}")
+
+    dirn = 1 if total >= 1.5 else -1 if total <= -1.5 else 0
+    aligned = sum(1 for c in comp if c.startswith("➕" if dirn > 0 else "➖")) if dirn else 0
+    label = "🟢 HAUSSIER" if dirn > 0 else "🔴 BAISSIER" if dirn < 0 else "⚪ SANS BIAS CLAIR"
+    color = GREEN if dirn > 0 else RED if dirn < 0 else GREY
+
+    lv = []
+    if daily:
+        lv += [("plus haut de la veille", daily["pdh"]), ("plus bas de la veille", daily["pdl"]),
+               ("EMA20 journalière", daily["ema20"]), ("EMA50 journalière", daily["ema50"])]
+    lv += [("haut asiatique", ah), ("bas asiatique", al)]
+    for k in range(int(np.floor((last - 0.01) / 0.005)), int(np.ceil((last + 0.01) / 0.005)) + 1):
+        lv.append((f"niveau rond {k * 0.005:.4f}", round(k * 0.005, 5)))
+    def _dedupe(arr):
+        out = []
+        for x in arr:
+            if not out or abs(x[1] - out[-1][1]) > 1.5 * PIP:
+                out.append(x)
+        return out[:3]
+    above = _dedupe(sorted([x for x in lv if x[1] > last + 5 * PIP], key=lambda x: x[1]))
+    below = _dedupe(sorted([x for x in lv if x[1] < last - 5 * PIP], key=lambda x: -x[1]))
+    fmt = lambda arr: " → ".join(f"{p:.5f} ({nm}, {abs(p - last) / PIP:.0f} pips)" for nm, p in arr) or "aucun niveau proche"
+
+    if dirn > 0:
+        main = (f"Rebond/hausse favorisé ({aligned} facteur(s) alignés). Achats sur repli plutôt que poursuite.\n"
+                f"Cibles : {fmt(above)}\nInvalidation : retour sous {below[0][1]:.5f} ({below[0][0]})" if below else f"Cibles : {fmt(above)}")
+        alt = f"Si cassure sous {below[0][1]:.5f} : retour au fond, ventes des rebonds vers {fmt(below[1:])}" if below else "—"
+    elif dirn < 0:
+        main = (f"Baisse favorisée ({aligned} facteur(s) alignés). Ventes sur rebond.\n"
+                f"Cibles : {fmt(below)}\nInvalidation : retour au-dessus de {above[0][1]:.5f} ({above[0][0]})" if above else f"Cibles : {fmt(below)}")
+        alt = f"Si cassure au-dessus de {above[0][1]:.5f} : rebond plus large vers {fmt(above[1:])}" if above else "—"
+    else:
+        main = (f"Pas de biais net : les facteurs se neutralisent. Option prudente : ne pas trader, ou scalps de range entre "
+                f"{below[0][1]:.5f} et {above[0][1]:.5f}." if above and below else "Pas de biais net.")
+        alt = "Une cassure franche d'un côté avec volume/momentum donnera la direction du jour."
+    if daily and dirn and dirn != daily["trend"] and daily["trend"]:
+        main += "\n⚠️ Contre le fond journalier : mouvement potentiellement plus court et plus fragile, scalps courts et stops serrés."
+
+    dd = df[df.index >= now.normalize()]
+    used = (float(dd.High.max()) - float(dd.Low.min())) / PIP
+    amp = f"Amplitude moyenne 10 jours : {daily['adr10']:.0f} pips | déjà parcourus aujourd'hui : {used:.0f} pips" if daily and daily.get("adr10") else f"Déjà parcourus aujourd'hui : {used:.0f} pips"
+
+    now_p = now.tz_convert(TZ)
+    today_fr = now_p.date()
+    ev_today = [e for e in events if e["time"].tz_convert(TZ).date() == today_fr and e["time"] > now]
+    ag = [f"{'🔴' if e['impact']=='High' else '🟠'} {hm(e['time'])} {ev_name(e)} — prévu {e['forecast'] or '?'} / préc. {e['previous'] or '?'}" for e in ev_today]
+    nxt = next((e for e in ev_today if e["impact"] == "High"), None)
+    if nxt:
+        end_win = nxt["time"] - pd.Timedelta(minutes=MAX_HOLD_MIN + 5)
+        win = (f"Fenêtre de scalp sans annonce : maintenant → {hm(end_win)}" if end_win > now
+               else "Plus de fenêtre de scalp avant l'annonce : attendre la réaction")
+        ag.append(f"\n⏳ Le scénario est valable jusqu'à {hm(nxt['time'])} ({ev_name(nxt)}), puis réévalué. {win}.")
+    else:
+        ag.append("\nAucune annonce majeure à venir aujourd'hui : journée pilotée par les flux et la liquidité des sessions.")
+    liq0, liq1 = pd.Timestamp(f"{now.date()} 12:00", tz="UTC"), pd.Timestamp(f"{now.date()} 16:00", tz="UTC")
+    ag.append(f"Liquidité maximale (Londres + New York) : {hm(liq0)}–{hm(liq1)}")
+
+    heads = "\n".join(f"{'🟢' if s>0 else '🔴' if s<0 else '•'} {fr(re.sub(r' - [^-]+$', '', t))[:130]}" for t, s in ctx["headlines"]) or "Aucun titre exploitable"
+    discord(f"🌅 Briefing de la journée — scénario {label}",
+            "Un scénario n'est pas une prévision : il repose sur des faits mesurés, il a un niveau d'invalidation, "
+            "et il est réévalué après chaque annonce majeure.", color,
+            [("🧭 Scénario principal", cut(main), False), ("🔀 Scénario alternatif", cut(alt), False),
+             ("📊 Facteurs mesurés", cut("\n".join(comp)), False), ("📏 Amplitude", amp, False),
+             ("🗓 Agenda & fenêtres (heure de Paris)", cut("\n".join(ag)), False), ("📰 Ce que dit la presse", cut(heads), False)])
+
+
+def event_kind(e):
+    n = e["name"].lower()
+    if any(k in n for k in ("speaks", "speech", "press conference", "fomc", "minutes", "rate decision", "rate statement",
+                            "monetary policy", "testifies", "president", "governor", "chair")):
+        return "cb", True
+    return "data", not any(k in n for k in ("unemployment", "jobless", "claims"))
+
+
+def get_event_chatter(e, max_items=4):
+    """Titres de presse récents sur les attentes autour de CETTE annonce."""
+    name = re.sub(r"\b(m/m|y/y|q/q|flash|prelim|final|revised)\b", "", e["name"], flags=re.I).strip()
+    zone = "US" if e["country"] == "USD" else "eurozone"
+    out, seen = [], set()
+    try:
+        r = requests.get("https://news.google.com/rss/search", timeout=15, headers={"User-Agent": "Mozilla/5.0"},
+                         params={"q": f"{zone} {name} expectations OR preview OR forecast when:2d", "hl": "en-US", "gl": "US", "ceid": "US:en"})
+        for it in ET.fromstring(r.content).iter("item"):
+            t = (it.findtext("title") or "").strip()
+            if t and t not in seen:
+                seen.add(t)
+                m = re.search(r" - ([^-]+)$", t)
+                out.append((re.sub(r" - [^-]+$", "", t), m.group(1) if m else ""))
+    except Exception as ex:
+        print("Bruits d'annonce indisponibles:", ex)
+    return out[:max_items]
+
+
+def event_preview(e, ctx, df, now):
+    m = int((e["time"] - now).total_seconds() / 60)
+    fc, pv = e["forecast"], e["previous"]
+    f_, p_ = num(fc), num(pv)
+    expect = "Consensus indisponible"
+    if f_ is not None and p_ is not None:
+        expect = f"Le consensus attend {'une hausse' if f_ > p_ else 'une baisse' if f_ < p_ else 'une stabilité'} ({pv} → {fc})"
+    kind, higher_good = event_kind(e)
+    cur = e["country"]
+    if kind == "data":
+        better, worse = ("AU-DESSUS", "EN DESSOUS") if higher_good else ("EN DESSOUS", "AU-DESSUS")
+        if cur == "USD":
+            eb, ew = "dollar soutenu → EUR/USD plutôt ⬇️", "dollar pénalisé → EUR/USD plutôt ⬆️"
+        else:
+            eb, ew = "euro soutenu → EUR/USD plutôt ⬆️", "euro pénalisé → EUR/USD plutôt ⬇️"
+        scen = (f"Chiffre {better} du consensus ({fc or '?'}) : {eb}\nChiffre {worse} du consensus : {ew}\n"
+                f"Proche du consensus : réaction souvent faible ou ambiguë → ne pas trader le 1er mouvement.")
+    else:
+        if cur == "USD":
+            scen = "Ton plus ferme (hawkish) : dollar soutenu → EUR/USD plutôt ⬇️\nTon plus accommodant (dovish) : dollar pénalisé → EUR/USD plutôt ⬆️"
+        else:
+            scen = "Ton plus ferme (hawkish) : euro soutenu → EUR/USD plutôt ⬆️\nTon plus accommodant (dovish) : euro pénalisé → EUR/USD plutôt ⬇️"
+    last = float(df.Close.iloc[-1])
+    drift = (last - float(df.Close.asof(now - pd.Timedelta(hours=1)))) / PIP
+    pos = f"Prix sur 1h : {drift:+.1f} pips ({'positionnement déjà en cours' if abs(drift) > 8 else 'marché plutôt calme avant l’annonce'})"
+    chat = get_event_chatter(e)
+    chat_txt = "\n".join(f"• {fr(t)[:140]}" + (f" ({s})" if s else "") for t, s in chat) or "Aucun titre pertinent trouvé"
+    discord(f"⚠️ {ev_name(e)} dans {m} min ({hm(e['time'])} Paris)",
+            f"{expect}\nPrévu : {fc or '?'} | Précédent : {pv or '?'}\nContexte actuel : {bias_label(ctx['bias']) if ctx else 'n/a'}",
+            ORANGE,
+            [("🎲 Scénarios selon le chiffre", scen, False), ("📈 Positionnement", pos, False),
+             ("🗞 Attentes dans la presse (pas d'infos privées)", cut(chat_txt), False),
+             ("🧭 Plan du bot", f"Aucun trade jusqu'à +3 min après la publication. Ensuite j'observe la réaction pendant 30 min et je ne propose un trade que dans le sens de l'impulsion, sur pullback.", False)])
 
 
 # ============ INDICATEURS ============
@@ -632,7 +824,7 @@ def backtest():
 def live(minutes):
     end = time.time() + minutes * 60
     events, ev_ts, ctx, ctx_ts, daily, daily_ts, read_ts = [], 0, None, 0, None, 0, 0
-    sent_briefs, sent_days = set(), set()
+    sent_briefs, sent_days, sent_morning = set(), set(), set()
     last_signal, count, last_idle, last_idle_ts = None, 0, None, 0
     discord("🤖 Bot EUR/USD en ligne", f"Surveillance active pendant ~{int(minutes/60)}h. Je ne te dérange que pour un vrai setup, une annonce ou une lecture de marché. Toutes les heures affichées sont en heure de Paris.", GREY)
     while time.time() < end:
@@ -651,6 +843,13 @@ def live(minutes):
                 market_read(ctx, events, now)
                 read_ts = time.time()
             today_fr = now.tz_convert(TZ).date()
+            hp = now.tz_convert(TZ).hour
+            if ctx and today_fr not in sent_morning and INTRADAY_START_HOUR <= hp < INTRADAY_START_HOUR + 2:
+                sent_morning.add(today_fr)
+                try:
+                    morning_briefing(ctx, events, df, daily, now)
+                except Exception as ex:
+                    print("Briefing impossible:", ex)
             if today_fr not in sent_days:
                 sent_days.add(today_fr)
                 today = [e for e in events if e["time"].tz_convert(TZ).date() == today_fr]
@@ -660,13 +859,10 @@ def live(minutes):
             for e in events:
                 m = (e["time"] - now).total_seconds() / 60
                 key = (e["time"], e["title"])
-                if e["impact"] == "High" and 0 < m <= 30 and key not in sent_briefs:
+                if e["impact"] == "High" and 0 < m <= 60 and key not in sent_briefs:
                     sent_briefs.add(key)
-                    bias = f"\nBiais actuel du marché : {bias_label(ctx['bias'])}" if ctx else ""
-                    discord(f"⚠️ {ev_name(e)} dans {int(m)} min",
-                            f"Heure : {hm(e['time'])} (Paris)\nPrévu : {e['forecast'] or '?'} | Précédent : {e['previous'] or '?'}{bias}\n\n"
-                            f"**Plan :** aucun trade jusqu'à +3 min après la publication. Ensuite je cherche un pullback dans le sens de l'impulsion.",
-                            ORANGE)
+                    if ctx:
+                        event_preview(e, ctx, df, now)
             s = decide(df, len(df) - 1, events, ctx)
             if "side" in s:
                 if (last_signal is None or (now - last_signal).total_seconds() > COOLDOWN_MIN * 60) and count < MAX_SIGNALS_PER_SESSION:
