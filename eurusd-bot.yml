@@ -2,16 +2,21 @@ name: EURUSD Scalp Bot
 
 on:
   schedule:
+    # Matin : 2 horaires UTC pour couvrir l'heure d'été ET d'hiver (le script s'arrête tout seul si ce n'est pas le bon)
+    - cron: "50 5 * * 1-5"
     - cron: "50 6 * * 1-5"
+    # Relais de l'après-midi (même principe)
+    - cron: "45 10 * * 1-5"
     - cron: "45 11 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
-        description: "test = message test Discord | backtest | live"
+        description: "test = message test Discord | backtest | live (jusqu'à 18h)"
         type: choice
         default: test
         options: [test, backtest, live]
 
+# Un seul bot à la fois : le relais attend la fin du créneau du matin
 concurrency:
   group: eurusd-bot
   cancel-in-progress: false
@@ -19,7 +24,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 320
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,7 +40,10 @@ jobs:
           MAX_HOLD_MIN: ${{ vars.MAX_HOLD_MIN || '45' }}
           READ_EVERY_MIN: ${{ vars.READ_EVERY_MIN || '60' }}
           MODE: ${{ github.event.inputs.mode || 'live' }}
+          SCHED: ${{ github.event.schedule }}
         run: |
           if [ "$MODE" = "backtest" ]; then python bot.py --backtest
           elif [ "$MODE" = "test" ]; then python bot.py --test-discord
-          else python bot.py --minutes 305; fi
+          elif [ "$SCHED" = "50 5 * * 1-5" ] || [ "$SCHED" = "50 6 * * 1-5" ]; then python bot.py --slot morning
+          elif [ -n "$SCHED" ]; then python bot.py --slot relay
+          else python bot.py --until 18:00 --minutes 340; fi
