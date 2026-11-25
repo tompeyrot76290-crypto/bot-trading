@@ -6,7 +6,8 @@ Le bot N'EXÉCUTE AUCUN ORDRE : il t'envoie des plans de trade que tu exécutes 
 Usage :
     python bot.py --test-discord      # envoie un message test
     python bot.py --backtest          # backtest technique sur ~7 jours
-    python bot.py --minutes 305       # mode live pendant 305 minutes
+    python bot.py --until 18:00       # mode live jusqu'à 18h (Paris)
+    python bot.py --slot morning      # (planificateur) créneau du matin ; --slot relay pour l'après-midi
 
 Variables d'environnement : DISCORD_WEBHOOK_URL, CAPITAL, RISK_PCT, RR, MIN_SCORE
 AVERTISSEMENT : aucun gain garanti. Backtest + compte démo avant tout argent réel.
@@ -31,7 +32,8 @@ MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "45"))   # durée max d'un trade (m
 COOLDOWN_MIN = 15
 MAX_SIGNALS_PER_SESSION = 3
 SPREAD_PIPS = 0.8
-TRADE_HOURS_UTC = (7, 17)
+SESSION_START_HOUR = int(os.getenv("SESSION_START_HOUR", "8"))     # heure de Paris
+SESSION_END_HOUR = int(os.getenv("SESSION_END_HOUR", "18"))        # heure de Paris
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 FEEDS = [
     "https://news.google.com/rss/search?q=EUR%2FUSD+OR+ECB+OR+Fed+OR+dollar+euro+when%3A1d&hl=en-US&gl=US&ceid=US%3Aen",
@@ -81,6 +83,12 @@ def fr(text):
 
 def ev_name(e):
     return f"{e['country']} {fr(e['name'])}"
+
+
+def in_window(ts):
+    """Vrai si ts (UTC) tombe dans la fenêtre de trading, en heure de Paris, du lundi au vendredi."""
+    p = pd.Timestamp(ts).tz_convert(TZ)
+    return p.weekday() < 5 and SESSION_START_HOUR <= p.hour < SESSION_END_HOUR
 
 
 # ============ DISCORD ============
@@ -472,8 +480,8 @@ def advise(ctx, df, events, now):
     de la direction mais limite la conviction et la durée."""
     row = df.iloc[-1]
     price, atr_pips = float(row.Close), float(row.atr) / PIP
-    if not (TRADE_HOURS_UTC[0] <= now.hour < TRADE_HOURS_UTC[1]) or now.weekday() >= 5:
-        return _wait("hors des heures de trading (Londres/New York)", "la prochaine session")
+    if not in_window(now):
+        return _wait(f"hors des heures de trading ({SESSION_START_HOUR}h–{SESSION_END_HOUR}h, heure de Paris)", "la prochaine session")
     state, info = news_state(now, events)
     if state == "block":
         return _wait(info, "3 minutes après la publication, puis je lis la réaction du prix avant d'agir")
@@ -564,7 +572,8 @@ def advise(ctx, df, events, now):
     return {"action": "long" if dirn > 0 else "short", "conv": conv, "h": h, "h_txt": h_txt, "sup": sup, "opp": opp,
             "entry_txt": entry_txt, "sl": sl, "tp": tp, "part": part, "stop_pips": stop_pips, "lots": lots,
             "risk_amt": risk_amt, "exit_by": now + pd.Timedelta(minutes=h), "caution": caution.strip(),
-            "invalid": swing, "score": D}
+            "invalid": swing, "score": D,
+            "entry": entry, "entry_type": "limit" if (ext > 2.5 or rsi_ext) else "market"}
 
 
 def advice_text(a):
@@ -590,7 +599,12 @@ def advice_text(a):
 
 def advice_field(ctx, df, events, now):
     try:
-        return ("🎯 Ce que je ferais maintenant", cut(advice_text(advise(ctx, df, events, now)), 1000), False)
+        a = advise(ctx, df, events, now)
+        try:
+            journal_log_advice(a, ctx, now, df)      # tout conseil montré est enregistré puis simulé
+        except Exception as ex:
+            print("Journal (conseil) :", ex)
+        return ("🎯 Ce que je ferais maintenant", cut(advice_text(a), 1000), False)
     except Exception as e:
         print("Conseil indisponible:", e)
         return None
@@ -719,6 +733,7 @@ def morning_briefing(ctx, events, df, daily, now):
              ("🧭 Scénario principal", cut(main), False), ("🔀 Scénario alternatif", cut(alt), False),
              ("📊 Facteurs mesurés", cut("\n".join(comp)), False), ("📏 Amplitude", amp, False),
              ("🗓 Agenda & fenêtres (heure de Paris)", cut("\n".join(ag)), False), ("📰 Ce que dit la presse", cut(heads), False)])
+    return dirn, last
 
 
 def event_kind(e):
@@ -899,8 +914,8 @@ def decide(df, i, events, ctx=None):
     row = df.iloc[i]
     now = df.index[i] + pd.Timedelta(minutes=1)
     hour = now.hour
-    if not (TRADE_HOURS_UTC[0] <= hour < TRADE_HOURS_UTC[1]) or now.weekday() >= 5:
-        return {"reason": "hors session (Londres/New York uniquement)"}
+    if not in_window(now):
+        return {"reason": f"hors session ({SESSION_START_HOUR}h–{SESSION_END_HOUR}h, heure de Paris)"}
     if now.weekday() == 4 and hour >= 16:
         return {"reason": "vendredi fin de session, liquidité faible"}
     state, info = news_state(now, events)
@@ -1052,14 +1067,339 @@ def backtest():
 
 
 # ============ LIVE ============
+# ============ JOURNAL AUTOMATIQUE (trades "papier") ============
+# Chaque signal / conseil montré à l'utilisateur est enregistré puis simulé minute par minute, comme si le bot tradait lui-même.
+JOURNAL_PATH = os.getenv("JOURNAL_PATH", "journal/trades.csv")
+ENTRY_VALID_MIN = 10      # un conseil "entrée sur repli" expire au bout de 10 min s'il n'est pas touché
+MIN_GROUP = 12            # nb mini de trades pour juger un sous-groupe
+MIN_TOTAL = 30            # nb mini de trades avant d'en tirer des conclusions
+JCOLS = ["id", "created", "kind", "side", "setup", "conv", "score", "entry_type", "entry", "sl", "tp", "part", "stop_pips",
+         "exit_by", "valid_until", "status", "fill_price", "fill_ts", "stage", "booked_r", "last_ts", "mfe", "mae", "exit_ts",
+         "exit_price", "result_r", "outcome", "reasons", "bias", "daily_trend", "intraday_dir", "atr_pips", "hour_paris", "near_event"]
+JR = {"rows": [], "dirty": False, "on": False}
+OUTCOME_FR = {"TP": "objectif atteint", "SL": "stop touché", "BE": "1R sécurisé puis stop à l'entrée", "TIME": "sortie à l'heure limite",
+              "FIN_SESSION": "fermé en fin de session", "NOFILL": "entrée jamais touchée", "NOFILL_TP": "objectif atteint sans repli (raté)"}
+
+
+def _num(x, default=0.0):
+    try:
+        if x is None or x == "" or (isinstance(x, float) and np.isnan(x)):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def j_load():
+    JR["rows"], JR["dirty"] = [], False
+    try:
+        if os.path.exists(JOURNAL_PATH):
+            d = pd.read_csv(JOURNAL_PATH)
+            JR["rows"] = d.astype(object).where(pd.notna(d), None).to_dict("records")
+    except Exception as e:
+        print("Journal illisible:", e)
+    JR["on"] = True
+
+
+def j_save():
+    if not JR["on"] or not JR["dirty"]:
+        return
+    try:
+        os.makedirs(os.path.dirname(JOURNAL_PATH) or ".", exist_ok=True)
+        pd.DataFrame(JR["rows"], columns=JCOLS).to_csv(JOURNAL_PATH, index=False)
+        JR["dirty"] = False
+    except Exception as e:
+        print("Journal non sauvegardé:", e)
+
+
+def _ctx_fields(ctx, now, df):
+    d = (ctx or {}).get("daily")
+    ia = (ctx or {}).get("intraday")
+    p = now.tz_convert(TZ)
+    nxt = next((e for e in (ctx or {}).get("_events", []) if e["impact"] == "High" and 0 < (e["time"] - now).total_seconds() <= 5400), None)
+    return {"bias": round(float((ctx or {}).get("bias", 0)), 2), "daily_trend": d["trend"] if d else 0,
+            "intraday_dir": ia["dirn"] if ia else 0, "atr_pips": round(float(df.atr.iloc[-1]) / PIP, 2),
+            "hour_paris": p.hour, "near_event": int(nxt is not None)}
+
+
+def _new_row(**kw):
+    r = {c: None for c in JCOLS}
+    r.update(kw)
+    JR["rows"].append(r)
+    JR["dirty"] = True
+    return r
+
+
+def _fill(r, ts):
+    f = float(r["entry"]) + (SPREAD_PIPS * PIP if r["side"] == "long" else 0.0)
+    r.update(status="open", fill_price=f, fill_ts=pd.Timestamp(ts).isoformat(), stage=0, booked_r=0.0, mfe=0.0, mae=0.0)
+
+
+def _close(r, ts, price, result, outcome):
+    r.update(status="closed", exit_ts=pd.Timestamp(ts).isoformat(), exit_price=float(price),
+             result_r=None if result is None else round(float(result), 3), outcome=outcome)
+
+
+def journal_log_advice(a, ctx, now, df):
+    if not JR["on"] or a.get("action") not in ("long", "short"):
+        return
+    side = a["action"]
+    for r in JR["rows"]:
+        if r["kind"] == "advice" and r["side"] == side:
+            if r["status"] in ("pending", "open") or (now - pd.Timestamp(r["created"])).total_seconds() < 20 * 60:
+                return   # même idée déjà en cours ou montrée il y a moins de 20 min
+    limit = a.get("entry_type") == "limit"
+    r = _new_row(id=f"{now:%Y%m%d-%H%M}-advice-{side}", created=now.isoformat(), kind="advice", side=side, setup="conseil",
+                 conv=a["conv"], score=round(float(a["score"]), 2), entry_type=a.get("entry_type", "market"),
+                 entry=float(a["entry"]), sl=float(a["sl"]), tp=float(a["tp"]), part=float(a["part"]), stop_pips=round(a["stop_pips"], 1),
+                 exit_by=a["exit_by"].isoformat(), valid_until=(now + pd.Timedelta(minutes=ENTRY_VALID_MIN)).isoformat(),
+                 status="pending", last_ts=(now - pd.Timedelta(minutes=1)).isoformat(),
+                 reasons=" ; ".join(a["sup"][:4]), **_ctx_fields(ctx, now, df))
+    if not limit:
+        _fill(r, now)
+
+
+def journal_log_signal(s, ctx, now, df):
+    if not JR["on"]:
+        return
+    r = _new_row(id=f"{now:%Y%m%d-%H%M}-signal-{s['side']}", created=now.isoformat(), kind="signal", side=s["side"],
+                 setup=str(s["reasons"][0])[:70], conv=s["score"], score=s["score"], entry_type="market", entry=float(s["entry"]),
+                 sl=float(s["sl"]), tp=float(s["tp"]), part=None, stop_pips=round(s["stop_pips"], 1),
+                 exit_by=(now + pd.Timedelta(minutes=MAX_HOLD_MIN)).isoformat(), valid_until=now.isoformat(), status="pending",
+                 last_ts=(now - pd.Timedelta(minutes=1)).isoformat(), reasons=" ; ".join(s["reasons"][:4]), **_ctx_fields(ctx, now, df))
+    _fill(r, now)
+
+
+def journal_log_wait(a, ctx, now, df):
+    if not JR["on"] or a.get("action") != "wait":
+        return
+    _new_row(id=f"{now:%Y%m%d-%H%M}-wait", created=now.isoformat(), kind="wait", side="none", entry=float(df.Close.iloc[-1]),
+             exit_by=(now + pd.Timedelta(minutes=60)).isoformat(), status="pending", mfe=0.0, mae=0.0,
+             last_ts=(now - pd.Timedelta(minutes=1)).isoformat(), reasons=str(a.get("reason", ""))[:200], **_ctx_fields(ctx, now, df))
+
+
+def journal_log_scenario(dirn, price, now):
+    if not JR["on"]:
+        return
+    _new_row(id=f"{now:%Y%m%d}-scenario", created=now.isoformat(), kind="scenario", side={1: "long", -1: "short"}.get(dirn, "none"),
+             entry=float(price), status="closed", outcome="SCENARIO")
+
+
+def _process_bar(r, ts, b):
+    side = 1 if r["side"] == "long" else -1
+    spr = SPREAD_PIPS * PIP
+    hi, lo, cl = float(b.High), float(b.Low), float(b.Close)
+    bar_end = ts + pd.Timedelta(minutes=1)
+    entry, sl, tp = float(r["entry"]), float(r["sl"]), float(r["tp"])
+    part = _num(r.get("part"), None)
+    if r["status"] == "pending":
+        touch = (lo <= entry) if side == 1 else (hi >= entry)
+        tp_hit = (hi >= tp) if side == 1 else (lo + spr <= tp)
+        if touch:
+            _fill(r, ts)
+        elif tp_hit:
+            _close(r, bar_end, tp, 0.0, "NOFILL_TP"); return
+        elif bar_end >= pd.Timestamp(r["valid_until"]):
+            _close(r, bar_end, cl, 0.0, "NOFILL"); return
+        else:
+            return
+    f = _num(r["fill_price"])
+    risk = max(abs(f - sl), 1e-9)
+    stage, booked = int(_num(r.get("stage"), 0)), _num(r.get("booked_r"), 0.0)
+    fav = ((hi - f) if side == 1 else (f - (lo + spr))) / PIP
+    adv = ((f - lo) if side == 1 else ((hi + spr) - f)) / PIP
+    r["mfe"], r["mae"] = round(max(_num(r.get("mfe")), fav), 1), round(max(_num(r.get("mae")), adv), 1)
+    rem = 0.5 if stage == 1 else 1.0
+    sl_cur = f if stage == 1 else sl
+    hit_sl = (lo <= sl_cur) if side == 1 else (hi + spr >= sl_cur)
+    hit_part = part is not None and stage == 0 and ((hi >= part) if side == 1 else (lo + spr <= part))
+    hit_tp = (hi >= tp) if side == 1 else (lo + spr <= tp)
+    Rx = lambda px: side * (px - f) / risk
+    if hit_sl:                                   # pessimiste : le stop passe avant l'objectif dans une même bougie
+        _close(r, bar_end, sl_cur, booked + rem * Rx(sl_cur), "SL" if stage == 0 else "BE"); return
+    if hit_part:
+        booked += 0.5 * Rx(part)
+        r["stage"], r["booked_r"], rem = 1, round(booked, 3), 0.5
+    if hit_tp:
+        _close(r, bar_end, tp, booked + rem * Rx(tp), "TP"); return
+    if bar_end >= pd.Timestamp(r["exit_by"]):
+        px = cl if side == 1 else cl + spr
+        _close(r, bar_end, px, booked + rem * Rx(px), "TIME")
+
+
+def _process_wait(r, ts, b):
+    base = float(r["entry"])
+    r["mfe"] = round(max(_num(r.get("mfe")), (float(b.High) - base) / PIP), 1)
+    r["mae"] = round(max(_num(r.get("mae")), (base - float(b.Low)) / PIP), 1)
+    if ts + pd.Timedelta(minutes=1) >= pd.Timestamp(r["exit_by"]):
+        _close(r, ts + pd.Timedelta(minutes=1), float(b.Close), None, "WAIT")
+
+
+def journal_update(df, now, final=False):
+    """Fait avancer tous les trades papier avec les bougies 1 min terminées. final=True : ferme tout en fin de session."""
+    if not JR["on"]:
+        return
+    for r in JR["rows"]:
+        if r["status"] not in ("pending", "open") or r["kind"] not in ("signal", "advice", "wait"):
+            continue
+        bars = df[df.index > pd.Timestamp(r["last_ts"])]
+        for ts, b in bars.iterrows():
+            (_process_wait if r["kind"] == "wait" else _process_bar)(r, ts, b)
+            r["last_ts"] = ts.isoformat()
+            JR["dirty"] = True
+            if r["status"] == "closed":
+                break
+        if final and r["status"] in ("pending", "open") and len(df):
+            last = float(df.Close.iloc[-1])
+            if r["kind"] == "wait":
+                _close(r, now, last, None, "WAIT")
+            elif r["status"] == "pending":
+                _close(r, now, last, 0.0, "NOFILL")
+            else:
+                side = 1 if r["side"] == "long" else -1
+                f = _num(r["fill_price"]); risk = max(abs(f - float(r["sl"])), 1e-9)
+                px = last if side == 1 else last + SPREAD_PIPS * PIP
+                rem = 0.5 if int(_num(r.get("stage"), 0)) == 1 else 1.0
+                _close(r, now, px, _num(r.get("booked_r")) + rem * side * (px - f) / risk, "FIN_SESSION")
+            JR["dirty"] = True
+
+
+# ---------- statistiques et analyse ----------
+def _done(rows):
+    return [r for r in rows if r["kind"] in ("signal", "advice") and r["status"] == "closed"
+            and r["outcome"] in ("TP", "SL", "BE", "TIME", "FIN_SESSION") and r["result_r"] is not None]
+
+
+def _stats(rows):
+    rs = [float(r["result_r"]) for r in sorted(rows, key=lambda x: x["created"])]
+    if not rs:
+        return None
+    a = np.array(rs)
+    cum = np.cumsum(a)
+    return {"n": len(a), "wr": float((a > 0.05).mean()), "total": float(a.sum()), "avg": float(a.mean()),
+            "best": float(a.max()), "worst": float(a.min()), "dd": float((np.maximum.accumulate(cum) - cum).max()),
+            "se": float(a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 9.0}
+
+
+def _groups(r):
+    g = [("Type", "signal technique" if r["kind"] == "signal" else "conseil"), ("Sens", "achat" if r["side"] == "long" else "vente")]
+    if r["kind"] == "signal":
+        g.append(("Setup", str(r["setup"])[:45]))
+        sc = _num(r["score"])
+        g.append(("Score du signal", "70-79" if sc < 80 else "80-89" if sc < 90 else "90+"))
+    else:
+        g.append(("Conviction du conseil", str(r["conv"])))
+    sgn = 1 if r["side"] == "long" else -1
+    dt = int(_num(r["daily_trend"]))
+    if dt:
+        g.append(("Par rapport au fond journalier", "dans le sens" if dt == sgn else "à contre-courant"))
+    h = int(_num(r["hour_paris"], 8))
+    b = min(16, max(8, 8 + 2 * ((h - 8) // 2)))
+    g.append(("Heure (Paris)", f"{b}h–{b + 2}h"))
+    g.append(("Annonce majeure dans les 90 min", "oui" if int(_num(r["near_event"])) else "non"))
+    return g
+
+
+def journal_insights(rows):
+    """Pistes d'amélioration, uniquement sur des sous-groupes assez grands. Rien n'est modifié automatiquement."""
+    done = _done(rows)
+    tot = _stats(done)
+    if not tot or tot["n"] < MIN_TOTAL:
+        n = tot["n"] if tot else 0
+        return [f"Échantillon : {n}/{MIN_TOTAL} trades. Trop peu pour conclure, je ne propose aucun changement (le hasard domine)."]
+    buckets = {}
+    for r in done:
+        for k in _groups(r):
+            buckets.setdefault(k, []).append(r)
+    out = []
+    for (dim, lab), rs in buckets.items():
+        s = _stats(rs)
+        if s and s["n"] >= MIN_GROUP:
+            weak = " (indice fragile)" if s["n"] < 20 else ""
+            if s["avg"] <= -0.15:
+                out.append((abs(s["avg"]) * np.sqrt(s["n"]), f"⚠️ {dim} « {lab} » : {s['avg']:+.2f}R/trade sur {s['n']} trades, win {s['wr']:.0%} → candidat à retirer ou durcir{weak}"))
+            elif s["avg"] - 1.96 * s["se"] > 0:
+                out.append((abs(s["avg"]) * np.sqrt(s["n"]), f"✅ {dim} « {lab} » : {s['avg']:+.2f}R/trade sur {s['n']} trades, win {s['wr']:.0%} → à garder, statistiquement solide"))
+            elif s["avg"] >= 0.25:
+                out.append((abs(s["avg"]) * np.sqrt(s["n"]) * 0.5, f"🟡 {dim} « {lab} » : {s['avg']:+.2f}R/trade sur {s['n']} trades → prometteur, pas encore prouvé{weak}"))
+    out = [t for _, t in sorted(out, key=lambda x: -x[0])[:6]]
+    return out or ["Aucun sous-groupe n'a assez de données pour conclure pour l'instant."]
+
+
+def _fmt_trade(r):
+    em = "✅" if float(r["result_r"]) > 0.05 else "❌" if float(r["result_r"]) < -0.05 else "➖"
+    return (f"{hm(pd.Timestamp(r['created']))} {'🟢' if r['side'] == 'long' else '🔴'} {'signal' if r['kind'] == 'signal' else 'conseil'} "
+            f"→ {em} {float(r['result_r']):+.2f}R ({OUTCOME_FR.get(r['outcome'], r['outcome'])})")
+
+
+def send_daily_recap(now, df=None):
+    rows = JR["rows"]
+    today = now.tz_convert(TZ).date()
+    day = [r for r in rows if r["kind"] in ("signal", "advice") and pd.Timestamp(r["created"]).tz_convert(TZ).date() == today]
+    done = _done(day)
+    st = _stats(done)
+    fields = []
+    if st:
+        head = (f"{st['n']} trade(s) simulé(s) : **{st['total']:+.2f}R** au total | réussite {st['wr']:.0%} | moyenne {st['avg']:+.2f}R | "
+                f"meilleur {st['best']:+.2f}R, pire {st['worst']:+.2f}R")
+        color = GREEN if st["total"] > 0.05 else RED if st["total"] < -0.05 else GREY
+        title = f"📒 Bilan de la journée : {st['total']:+.2f}R"
+        fields.append(("🧾 Détail des trades (simulés comme si le bot tradait)", cut("\n".join(_fmt_trade(r) for r in sorted(done, key=lambda x: x["created"]))), False))
+    else:
+        head, color, title = "Aucun trade simulé n'est allé au bout aujourd'hui (pas de conseil d'achat/vente ni de signal exécutable).", GREY, "📒 Bilan de la journée : 0 trade"
+    skipped = [r for r in day if r["outcome"] in ("NOFILL", "NOFILL_TP")]
+    if skipped:
+        miss = sum(1 for r in skipped if r["outcome"] == "NOFILL_TP")
+        fields.append(("⏭ Non exécutés", f"{len(skipped)} conseil(s) à entrer sur repli : l'entrée n'a jamais été touchée"
+                                          + (f", dont {miss} où le prix est parti directement à l'objectif (occasion ratée)." if miss else "."), False))
+    waits = [r for r in rows if r["kind"] == "wait" and r["status"] == "closed" and pd.Timestamp(r["created"]).tz_convert(TZ).date() == today]
+    if waits:
+        big = sum(1 for r in waits if max(_num(r["mfe"]), _num(r["mae"])) >= 15)
+        fields.append(("⚪ Quand j'ai dit « attendre »", f"{len(waits)} fois ; {big} fois le prix a bougé de 15 pips ou plus dans l'heure qui a suivi "
+                                                        f"({'occasions possiblement manquées' if big else 'attendre était justifié'}).", False))
+    sc = next((r for r in rows if r["kind"] == "scenario" and pd.Timestamp(r["created"]).tz_convert(TZ).date() == today), None)
+    if sc and df is not None and len(df):
+        mv = (float(df.Close.iloc[-1]) - float(sc["entry"])) / PIP
+        want = {"long": 1, "short": -1}.get(sc["side"], 0)
+        verdict = ("➖ pas de biais annoncé" if want == 0 else "✅ cohérent" if mv * want >= 5 else "❌ opposé" if mv * want <= -5 else "➖ trop proche de zéro pour juger")
+        fields.append(("🌅 Scénario du matin vs réalité", f"Scénario : {'haussier' if want > 0 else 'baissier' if want < 0 else 'sans biais'} | "
+                                                          f"le prix a fait {mv:+.0f} pips depuis le briefing → {verdict}", False))
+    cum = _stats(_done(rows))
+    if cum:
+        fields.append(("📈 Cumul depuis le début", f"{cum['n']} trades | **{cum['total']:+.2f}R** | réussite {cum['wr']:.0%} | moyenne {cum['avg']:+.2f}R | "
+                                                  f"pire série (drawdown) {cum['dd']:.1f}R" + ("" if cum["n"] >= MIN_TOTAL else f"\n_Encore {MIN_TOTAL - cum['n']} trades avant que les chiffres veuillent dire quelque chose._"), False))
+    fields.append(("🔧 Ce que j'en retiens (aucune modification automatique)", cut("\n".join(journal_insights(rows))), False))
+    discord(title, head + "\n\n_Simulation avec spread de " + f"{SPREAD_PIPS:g} pip ; en cas de doute dans une bougie, le stop passe avant l'objectif._", color, fields)
+
+
+def send_report():
+    """Rapport cumulatif à la demande (mode 'report')."""
+    j_load()
+    st = _stats(_done(JR["rows"]))
+    if not st:
+        discord("📊 Rapport du journal", "Pas encore de trade simulé terminé dans le journal.", GREY)
+        return
+    discord(f"📊 Rapport du journal : {st['n']} trades, {st['total']:+.2f}R",
+            f"Réussite {st['wr']:.0%} | moyenne {st['avg']:+.2f}R/trade | meilleur {st['best']:+.2f}R | pire {st['worst']:+.2f}R | drawdown {st['dd']:.1f}R",
+            GREEN if st["total"] > 0 else RED, [("🔧 Pistes d'amélioration (rien n'est appliqué tout seul)", cut("\n".join(journal_insights(JR["rows"]))), False)])
+
+
 ACT_LABEL = {"wait": "⚪ ATTENDRE", "long": "🟢 ACHETER", "short": "🔴 VENDRE"}
 
 
-def live(minutes):
+def live(minutes, until=None, announce_start=True, announce_end=True):
     """Cadence des messages (voir README) : briefing 8h, point marché toutes les READ_EVERY_MIN min (rapide/complet en alternance),
     aperçu 60 min avant une annonce majeure, réaction 5 min après, alerte quand le conseil change durablement,
     alerte mouvement rapide, signaux d'entrée. Plafond anti-spam pour les messages non critiques."""
     end = time.time() + minutes * 60
+    if until:  # "HH:MM" en heure de Paris
+        hh, mm = map(int, until.split(":"))
+        tgt = pd.Timestamp.now(tz="UTC").tz_convert(TZ).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        end = min(end, time.time() + (tgt - pd.Timestamp.now(tz="UTC")).total_seconds())
+    if end <= time.time() + 60:
+        print("Rien à surveiller : fin de fenêtre atteinte.")
+        return
+    minutes = (end - time.time()) / 60
     events, ev_ts, ctx, ctx_ts, daily, daily_ts = [], 0, None, 0, None, 0
     sent_briefs, sent_reacts, sent_morning = set(), set(), set()
     last_signal, count = None, 0
@@ -1068,18 +1408,21 @@ def live(minutes):
     reads = 0
     last_key, cand_key, cand_n, last_change_ts, last_fast_ts = None, None, 0, 0, 0
     soft = []
+    df = None
+    j_load()
 
     def soft_ok():
         soft[:] = [t for t in soft if time.time() - t < 3600]
         return len(soft) < MAX_SOFT_PER_HOUR
 
-    discord("🤖 Bot EUR/USD en ligne",
-            f"Surveillance active ~{int(minutes/60)}h (heure de Paris). Cadence : briefing le matin, point marché toutes les {READ_EVERY_MIN} min, "
+    if announce_start:
+        discord("🤖 Bot EUR/USD en ligne",
+            f"Surveillance active jusqu'à {hm(pd.Timestamp.now(tz='UTC') + pd.Timedelta(minutes=minutes))} (heure de Paris). Cadence : briefing le matin, point marché toutes les {READ_EVERY_MIN} min, "
             f"+ alertes quand ça compte (annonce, changement de conseil, mouvement rapide, signal).", GREY)
     while time.time() < end:
         try:
             now = pd.Timestamp.now(tz="UTC")
-            in_session = TRADE_HOURS_UTC[0] <= now.hour < TRADE_HOURS_UTC[1] and now.weekday() < 5
+            in_session = in_window(now)
             if time.time() - ev_ts > 6 * 3600:
                 ev = get_events()
                 if ev is not None:
@@ -1089,6 +1432,9 @@ def live(minutes):
             df = add_indicators(get_candles("5d")).iloc[:-1]  # retire la bougie en cours
             if time.time() - ctx_ts > 600:
                 ctx, ctx_ts = build_context(daily, df, events, now), time.time()
+            if ctx:
+                ctx["_events"] = events
+            journal_update(df, now)                            # fait avancer les trades simulés
             today_fr = now.tz_convert(TZ).date()
             hp = now.tz_convert(TZ).hour
             quiet = time.time() - _LAST_SENT["t"]
@@ -1097,7 +1443,9 @@ def live(minutes):
             if ctx and today_fr not in sent_morning and INTRADAY_START_HOUR <= hp < INTRADAY_START_HOUR + 2:
                 sent_morning.add(today_fr)
                 try:
-                    morning_briefing(ctx, events, df, daily, now)
+                    res = morning_briefing(ctx, events, df, daily, now)
+                    if res:
+                        journal_log_scenario(res[0], res[1], now)
                     read_ts, reads = time.time(), 1
                 except Exception as ex:
                     print("Briefing impossible:", ex)
@@ -1124,6 +1472,10 @@ def live(minutes):
                 reads += 1
                 read_ts = time.time()
                 soft.append(time.time())
+                try:
+                    journal_log_wait(advise(ctx, df, events, now), ctx, now, df)   # pour mesurer les occasions manquées
+                except Exception as ex:
+                    print("Journal (attendre) :", ex)
 
             quiet = time.time() - _LAST_SENT["t"]
             if ctx and in_session:
@@ -1156,22 +1508,59 @@ def live(minutes):
             if "side" in s:
                 if (last_signal is None or (now - last_signal).total_seconds() > COOLDOWN_MIN * 60) and count < MAX_SIGNALS_PER_SESSION:
                     send_signal(s)
+                    journal_log_signal(s, ctx, now, df)
                     last_signal, count = now, count + 1
         except Exception as ex:
             print("Erreur boucle:", ex)
+        j_save()
         time.sleep(60 - time.time() % 60 + 5)
-    discord("🛑 Session terminée", "Le bot reprendra à la prochaine session planifiée.", GREY)
+    try:
+        if df is not None:
+            nowf = pd.Timestamp.now(tz="UTC")
+            if announce_end:
+                journal_update(df, nowf, final=True)     # ferme les trades encore ouverts en fin de session
+            j_save()
+            if announce_end:
+                send_daily_recap(nowf, df)               # bilan de 18h (pas de message à chaque trade)
+    except Exception as ex:
+        print("Bilan impossible:", ex)
+    if announce_end:
+        discord("🛑 Session terminée", "Le bot reprendra à la prochaine session (demain 8h, heure de Paris).", GREY)
+
+
+SLOTS = {"morning": (7.0, 11.0, "13:00", True, False), "relay": (12.0, 17.0, "18:00", False, True)}
+
+
+def run_slot(slot):
+    """Lancé par le planificateur GitHub. Vérifie l'heure de Paris : en cas de doublon (heure d'été/hiver), il s'arrête seul."""
+    p = pd.Timestamp.now(tz="UTC").tz_convert(TZ)
+    lo, hi, until, ann_start, ann_end = SLOTS[slot]
+    h = p.hour + p.minute / 60
+    if p.weekday() >= 5:
+        print("Week-end : rien à faire.")
+        return
+    if not (lo <= h < hi):
+        print(f"Créneau '{slot}' hors fenêtre ({p:%H:%M} Paris) : je m'arrête, c'est normal (doublon heure d'été/hiver).")
+        return
+    live(360, until=until, announce_start=ann_start, announce_end=ann_end)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--backtest", action="store_true")
     ap.add_argument("--test-discord", action="store_true")
-    ap.add_argument("--minutes", type=int, default=305)
+    ap.add_argument("--minutes", type=int, default=340)
+    ap.add_argument("--until", default=None, help="heure de fin HH:MM (Paris)")
+    ap.add_argument("--slot", choices=list(SLOTS), default=None)
+    ap.add_argument("--report", action="store_true", help="envoie le rapport cumulatif du journal")
     a = ap.parse_args()
     if a.backtest:
         backtest()
     elif a.test_discord:
         discord("✅ Test Discord OK", "Le bot peut t'écrire sur ce salon.", GREEN)
+    elif a.report:
+        send_report()
+    elif a.slot:
+        run_slot(a.slot)
     else:
-        live(a.minutes)
+        live(a.minutes, until=a.until)
