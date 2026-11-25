@@ -11,10 +11,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "test = message test Discord | backtest | live (jusqu'à 18h)"
+        description: "test = message test | backtest | report = bilan cumulatif du journal | live (jusqu'à 18h)"
         type: choice
         default: test
-        options: [test, backtest, live]
+        options: [test, backtest, report, live]
 
 # Un seul bot à la fois : le relais attend la fin du créneau du matin
 concurrency:
@@ -25,6 +25,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 345
+    permissions:
+      contents: write   # nécessaire pour que le bot enregistre son journal dans le dépôt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,6 +46,18 @@ jobs:
         run: |
           if [ "$MODE" = "backtest" ]; then python bot.py --backtest
           elif [ "$MODE" = "test" ]; then python bot.py --test-discord
+          elif [ "$MODE" = "report" ]; then python bot.py --report
           elif [ "$SCHED" = "50 5 * * 1-5" ] || [ "$SCHED" = "50 6 * * 1-5" ]; then python bot.py --slot morning
           elif [ -n "$SCHED" ]; then python bot.py --slot relay
           else python bot.py --until 18:00 --minutes 340; fi
+      - name: Sauvegarder le journal dans le dépôt
+        if: always()
+        run: |
+          if [ -d journal ] && [ -n "$(git status --porcelain journal)" ]; then
+            git config user.name "eurusd-bot"
+            git config user.email "eurusd-bot@users.noreply.github.com"
+            git add journal
+            git commit -m "Journal du bot $(date -u '+%F %H:%M') UTC"
+            git pull --rebase --autostash || true
+            git push
+          fi
