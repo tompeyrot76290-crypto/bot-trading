@@ -1,0 +1,2 @@
+id,created,kind,side,setup,conv,score,entry_type,entry,sl,tp,part,stop_pips,exit_by,valid_until,status,fill_price,fill_ts,stage,booked_r,last_ts,mfe,mae,exit_ts,exit_price,result_r,outcome,reasons,bias,daily_trend,intraday_dir,atr_pips,hour_paris,near_event
+20261126-1600-wait,2026-11-26T16:00:19.728745+00:00,wait,none,,,,,1.0976948738098145,,,,,2026-11-26T17:00:19.728745+00:00,,closed,,,,,2026-11-26T16:57:00+00:00,1.2,4.8,2026-11-26T17:00:05.000137+00:00,1.0974539518356323,,WAIT,marché trop calme (ATR 0.3 pips) : pas assez de mouvement pour viser 2R,0.5,-1,0,0.32,17,0
