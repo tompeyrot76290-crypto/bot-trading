@@ -1398,7 +1398,8 @@ def live(minutes, until=None, announce_start=True, announce_end=True):
         end = min(end, time.time() + (tgt - pd.Timestamp.now(tz="UTC")).total_seconds())
     if end <= time.time() + 60:
         print("Rien à surveiller : fin de fenêtre atteinte.")
-        return
+        return False
+    t_start = time.time()
     minutes = (end - time.time()) / 60
     events, ev_ts, ctx, ctx_ts, daily, daily_ts = [], 0, None, 0, None, 0
     sent_briefs, sent_reacts, sent_morning = set(), set(), set()
@@ -1514,18 +1515,21 @@ def live(minutes, until=None, announce_start=True, announce_end=True):
             print("Erreur boucle:", ex)
         j_save()
         time.sleep(60 - time.time() % 60 + 5)
+    nowf = pd.Timestamp.now(tz="UTC")
+    p = nowf.tz_convert(TZ)
+    # La session est vraiment finie seulement vers 18h (un job GitHub est limité à ~6h : sinon un relais prend la suite)
+    over = p.weekday() >= 5 or p.hour * 60 + p.minute >= SESSION_END_HOUR * 60 - 5
     try:
-        if df is not None:
-            nowf = pd.Timestamp.now(tz="UTC")
-            if announce_end:
-                journal_update(df, nowf, final=True)     # ferme les trades encore ouverts en fin de session
-            j_save()
-            if announce_end:
-                send_daily_recap(nowf, df)               # bilan de 18h (pas de message à chaque trade)
+        if over and df is not None:
+            journal_update(df, nowf, final=True)     # ferme les trades encore ouverts en fin de session
+        j_save()
+        if over and df is not None:
+            send_daily_recap(nowf, df)               # bilan de 18h (pas de message à chaque trade)
     except Exception as ex:
         print("Bilan impossible:", ex)
-    if announce_end:
+    if over:
         discord("🛑 Session terminée", "Le bot reprendra à la prochaine session (demain 8h, heure de Paris).", GREY)
+    return (not over) and (time.time() - t_start >= 600)   # True = il faut lancer un relais immédiat
 
 
 SLOTS = {"morning": (7.0, 11.0, "13:00", True, False), "relay": (12.0, 17.0, "18:00", False, True)}
@@ -1538,11 +1542,11 @@ def run_slot(slot):
     h = p.hour + p.minute / 60
     if p.weekday() >= 5:
         print("Week-end : rien à faire.")
-        return
+        return False
     if not (lo <= h < hi):
         print(f"Créneau '{slot}' hors fenêtre ({p:%H:%M} Paris) : je m'arrête, c'est normal (doublon heure d'été/hiver).")
-        return
-    live(360, until=until, announce_start=ann_start, announce_end=ann_end)
+        return False
+    return live(360, until=until, announce_start=ann_start, announce_end=ann_end)
 
 
 if __name__ == "__main__":
@@ -1553,6 +1557,7 @@ if __name__ == "__main__":
     ap.add_argument("--until", default=None, help="heure de fin HH:MM (Paris)")
     ap.add_argument("--slot", choices=list(SLOTS), default=None)
     ap.add_argument("--report", action="store_true", help="envoie le rapport cumulatif du journal")
+    ap.add_argument("--handoff", action="store_true", help="reprise silencieuse après un relais (pas de message 'en ligne')")
     a = ap.parse_args()
     if a.backtest:
         backtest()
@@ -1560,7 +1565,8 @@ if __name__ == "__main__":
         discord("✅ Test Discord OK", "Le bot peut t'écrire sur ce salon.", GREEN)
     elif a.report:
         send_report()
-    elif a.slot:
-        run_slot(a.slot)
     else:
-        live(a.minutes, until=a.until)
+        need_relay = run_slot(a.slot) if a.slot else live(a.minutes, until=a.until, announce_start=not a.handoff)
+        if need_relay:                       # le workflow lira ce fichier et relancera tout de suite le bot
+            open(".relay_needed", "w").write("1")
+            print("Session non terminée : relais demandé.")
