@@ -77,5 +77,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -f .relay_needed ]; then
-            gh workflow run eurusd-bot.yml -f mode=live -f handoff=true
+            gh workflow run "${{ github.workflow }}" -f mode=live -f handoff=true
           fi
