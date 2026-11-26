@@ -1391,6 +1391,11 @@ def live(minutes, until=None, announce_start=True, announce_end=True):
     """Cadence des messages (voir README) : briefing 8h, point marché toutes les READ_EVERY_MIN min (rapide/complet en alternance),
     aperçu 60 min avant une annonce majeure, réaction 5 min après, alerte quand le conseil change durablement,
     alerte mouvement rapide, signaux d'entrée. Plafond anti-spam pour les messages non critiques."""
+    p0 = pd.Timestamp.now(tz="UTC").tz_convert(TZ)
+    m0 = p0.hour * 60 + p0.minute
+    if p0.weekday() >= 5 or not (7 * 60 + 30 <= m0 < SESSION_END_HOUR * 60):
+        print(f"Hors fenêtre de trading ({JOURS[p0.weekday()]} {p0:%H:%M}, heure de Paris) : le bot ne démarre pas et n'envoie rien.")
+        return False
     end = time.time() + minutes * 60
     if until:  # "HH:MM" en heure de Paris
         hh, mm = map(int, until.split(":"))
@@ -1518,7 +1523,8 @@ def live(minutes, until=None, announce_start=True, announce_end=True):
     nowf = pd.Timestamp.now(tz="UTC")
     p = nowf.tz_convert(TZ)
     # La session est vraiment finie seulement vers 18h (un job GitHub est limité à ~6h : sinon un relais prend la suite)
-    over = p.weekday() >= 5 or p.hour * 60 + p.minute >= SESSION_END_HOUR * 60 - 5
+    mod = p.hour * 60 + p.minute
+    over = p.weekday() >= 5 or mod >= SESSION_END_HOUR * 60 - 5 or mod < 7 * 60 + 30
     try:
         if over and df is not None:
             journal_update(df, nowf, final=True)     # ferme les trades encore ouverts en fin de session
