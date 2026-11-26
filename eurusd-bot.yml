@@ -15,6 +15,10 @@ on:
         type: choice
         default: test
         options: [test, backtest, report, live]
+      handoff:
+        description: "(automatique) reprise silencieuse après un relais"
+        type: boolean
+        default: false
 
 # Un seul bot à la fois : le relais attend la fin du créneau du matin
 concurrency:
@@ -27,6 +31,7 @@ jobs:
     timeout-minutes: 345
     permissions:
       contents: write   # nécessaire pour que le bot enregistre son journal dans le dépôt
+      actions: write    # nécessaire pour que le bot relance tout seul la suite de la journée
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,6 +47,7 @@ jobs:
           MAX_HOLD_MIN: ${{ vars.MAX_HOLD_MIN || '45' }}
           READ_EVERY_MIN: ${{ vars.READ_EVERY_MIN || '60' }}
           MODE: ${{ github.event.inputs.mode || 'live' }}
+          HANDOFF: ${{ github.event.inputs.handoff }}
           SCHED: ${{ github.event.schedule }}
         run: |
           if [ "$MODE" = "backtest" ]; then python bot.py --backtest
@@ -49,7 +55,11 @@ jobs:
           elif [ "$MODE" = "report" ]; then python bot.py --report
           elif [ "$SCHED" = "50 5 * * 1-5" ] || [ "$SCHED" = "50 6 * * 1-5" ]; then python bot.py --slot morning
           elif [ -n "$SCHED" ]; then python bot.py --slot relay
-          else python bot.py --until 18:00 --minutes 340; fi
+          else
+            EXTRA=""
+            if [ "$HANDOFF" = "true" ]; then EXTRA="--handoff"; fi
+            python bot.py --until 18:00 --minutes 340 $EXTRA
+          fi
       - name: Sauvegarder le journal dans le dépôt
         if: always()
         run: |
@@ -60,4 +70,12 @@ jobs:
             git commit -m "Journal du bot $(date -u '+%F %H:%M') UTC"
             git pull --rebase --autostash || true
             git push
+          fi
+      - name: Relais automatique (si la journée n'est pas finie)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f .relay_needed ]; then
+            gh workflow run eurusd-bot.yml -f mode=live -f handoff=true
           fi
